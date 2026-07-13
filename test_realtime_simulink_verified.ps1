@@ -8,9 +8,15 @@
 $BASE_URL = "http://localhost:8000"
 
 # ---- Simulink 联调密钥 ----
-# 必须与后端 .env 中的 SIMULINK_SOURCE_TOKEN 一致
-# 也可从环境变量读取: $env:SIMULINK_SOURCE_TOKEN
-$SIMULINK_TOKEN = "simulink-2026-secret"
+# 从环境变量读取，绝不硬编码真实 token
+# 使用前请先设置: $env:SIMULINK_SOURCE_TOKEN = "你的密钥"
+if ($env:SIMULINK_SOURCE_TOKEN) {
+    $SIMULINK_TOKEN = $env:SIMULINK_SOURCE_TOKEN
+} else {
+    Write-Host "ERROR: 请先设置环境变量 SIMULINK_SOURCE_TOKEN" -ForegroundColor Red
+    Write-Host '  例如: $env:SIMULINK_SOURCE_TOKEN = "your_token_here"' -ForegroundColor Yellow
+    exit 1
+}
 
 # ---- 构造 33 节点测试数据 ----
 $nodes = @()
@@ -144,7 +150,7 @@ if ($pass) {
 } else {
     Write-Host ""
     Write-Host "  ⚠ 验证失败，请检查:" -ForegroundColor Red
-    Write-Host "    1) 后端 .env 中 SIMULINK_SOURCE_TOKEN 是否为 simulink-2026-secret" -ForegroundColor Red
+    Write-Host "    1) 后端 .env 中 SIMULINK_SOURCE_TOKEN 是否为 你的约定密钥" -ForegroundColor Red
     Write-Host "    2) 请求头 X-Simulink-Token 是否正确" -ForegroundColor Red
 }
 

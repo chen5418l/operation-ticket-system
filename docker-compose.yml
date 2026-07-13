@@ -6,7 +6,7 @@ services:
     container_name: power_ticket_mysql
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change_me}
       MYSQL_DATABASE: power_ticket_system
       MYSQL_CHARSET: utf8mb4
       MYSQL_COLLATION: utf8mb4_unicode_ci
@@ -33,7 +33,7 @@ services:
       DB_HOST: mysql
       DB_PORT: 3306
       DB_USER: root
-      DB_PASSWORD: root123
+      DB_PASSWORD: ${DB_PASSWORD:-change_me}
       DB_NAME: power_ticket_system
       BACKEND_HOST: 0.0.0.0
       BACKEND_PORT: 8000
