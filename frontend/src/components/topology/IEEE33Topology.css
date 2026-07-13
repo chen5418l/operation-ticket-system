@@ -1,0 +1,116 @@
+/* IEEE33 配电网单线图容器 */
+.ieee33-container {
+  background: #0a1622;
+  border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.08);
+  overflow: auto;
+  position: relative;
+  user-select: none;
+  min-height: 460px;
+}
+.ieee33-container svg {
+  display: block;
+  min-width: 100%;
+  height: auto;
+}
+/* 节点动画 */
+.ieee33-node {
+  cursor: pointer;
+  transition: filter 0.2s;
+}
+.ieee33-node:hover {
+  filter: brightness(1.4);
+}
+/* 按钮栏 */
+.ieee33-toolbar {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  padding: 10px 14px;
+  background: #f3f6f9;
+  border-radius: 6px;
+  border: 1px solid #c8d6e5;
+  margin-bottom: 12px;
+  font-size: 12px;
+}
+.ieee33-toolbar button {
+  padding: 5px 12px;
+  border-radius: 4px;
+  font-size: 11px;
+  cursor: pointer;
+  font-weight: 500;
+  border: 1px solid #c8d6e5;
+  background: #fff;
+  color: #1f2937;
+  transition: all 0.15s;
+}
+.ieee33-toolbar button.active {
+  background: #e74c3c;
+  color: #fff;
+  border-color: #e74c3c;
+}
+.ieee33-toolbar button.primary {
+  background: #1f8a4c;
+  color: #fff;
+  border-color: #1f8a4c;
+}
+.ieee33-toolbar button:hover { opacity: 0.85; }
+/* 详情面板 */
+.ieee33-panel {
+  position: fixed;
+  width: 300px;
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+  padding: 16px;
+  z-index: 1000;
+  border: 1px solid #c8d6e5;
+  max-height: 420px;
+  overflow-y: auto;
+  font-size: 12px;
+}
+.ieee33-panel h4 {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1f2937;
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #e2e8f0;
+}
+.ieee33-panel-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 5px 0;
+  border-bottom: 1px solid #f3f6f9;
+}
+.ieee33-panel-row .lbl { color: #667085; }
+.ieee33-panel-row .val { color: #1f2937; text-align: right; max-width: 160px; word-break: break-all; }
+.ieee33-panel .btn-row { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+.ieee33-panel .btn-row button { padding: 6px 0; border-radius: 4px; font-size: 12px; cursor: pointer; width: 100%; }
+/* 方案面板 */
+.ieee33-plans {
+  margin-top: 12px;
+  padding: 12px 14px;
+  background: #fff;
+  border-radius: 6px;
+  border: 1px solid #c8d6e5;
+  font-size: 12px;
+}
+.ieee33-plans .plan-btn {
+  padding: 5px 12px;
+  border-radius: 4px;
+  font-size: 11px;
+  cursor: pointer;
+  border: 1px solid #c8d6e5;
+  background: #f3f6f9;
+  color: #1f2937;
+  margin-right: 8px;
+  margin-bottom: 4px;
+}
+.ieee33-plans .plan-btn.selected {
+  background: #2ecc71; color: #fff; border-color: #2ecc71;
+}
+.ieee33-plans .plan-btn.recommended {
+  background: #e8f5e9; color: #1f8a4c; border-color: #1f8a4c;
+}
