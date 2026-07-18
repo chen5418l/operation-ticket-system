@@ -42,28 +42,34 @@ export default function Dashboard() {
   const [rtMetrics, setRtMetrics] = useState<ReturnType<typeof computeRealtimeMetrics> | null>(null);
 
   useEffect(() => {
-    // 优先尝试实时数据
-    realtimeApi.getLatest().then((data) => {
-      if (data?.success && data.has_data && data.nodes && data.nodes.length > 0) {
-        setRealtimeData(data);
-        setDataSource('realtime');
-        setRtMetrics(computeRealtimeMetrics(data.nodes));
-        // 同时仍获取 summary 作为后备展示
-        fetch('http://localhost:8000/api/dashboard/summary')
-          .then((r) => r.json())
-          .then((res) => { if (res.data) setSummary(res.data); })
-          .catch(() => {});
-      } else {
-        // 实时数据为空或 has_data=false，回退 summary
-        setRealtimeData(data); // 保留以便显示状态标签
+    let mounted = true;
+
+    function pollRealtime() {
+      realtimeApi.getLatest().then((data) => {
+        if (!mounted) return;
+        if (data?.success && data.has_data && data.nodes && data.nodes.length > 0) {
+          setRealtimeData(data);
+          setDataSource('realtime');
+          setRtMetrics(computeRealtimeMetrics(data.nodes));
+          // debug: 输出实时电压最小值
+          const rv = data.nodes.map(n => n.voltage_pu).filter(v => v != null);
+          console.log('[realtime] min voltage_pu from API:', Math.min(...rv).toFixed(4),
+                      '| page minVoltage:', computeRealtimeMetrics(data.nodes).min_voltage_pu.toFixed(4));
+        } else {
+          setRealtimeData(data);
+          setDataSource('fallback');
+          fetchSummary();
+        }
+      }).catch(() => {
+        if (!mounted) return;
         setDataSource('fallback');
         fetchSummary();
-      }
-    }).catch(() => {
-      // 实时接口异常，回退 summary
-      setDataSource('fallback');
-      fetchSummary();
-    });
+      });
+    }
+
+    pollRealtime();
+    const timer = setInterval(pollRealtime, 4000);
+    return () => { mounted = false; clearInterval(timer); };
   }, []);
 
   function fetchSummary() {

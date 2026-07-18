@@ -343,3 +343,20 @@ def realtime_clear():
         "success": True,
         "message": "实时数据缓存已清空",
     }
+
+
+# ==================== 共享请求模型（供 main.py 使用）====================
+
+class ForecastRealtimeRequest(BaseModel):
+    horizon: int = 24
+    interval_minutes: int = 60
+    base_hour: int = -1  # -1 表示使用 realtime timestamp 或服务器小时
+    horizon_hours: int = 0  # 兼容字段
+
+
+class FaultAnalyzeRealtimeRequest(BaseModel):
+    fault_line: str = "8-9"
+
+
+class TransferEvaluateRealtimeRequest(BaseModel):
+    fault_line: str = "8-9"

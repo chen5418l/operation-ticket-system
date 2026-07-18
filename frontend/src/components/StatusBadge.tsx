@@ -8,6 +8,8 @@ const statusColors: Record<string, { bg: string; color: string; border: string }
   '待更新': { bg: '#fff8e1', color: '#b8860b', border: '#ffe082' },
   '异常': { bg: '#ffebee', color: '#eb5757', border: '#ffcdd2' },
   '通过': { bg: '#e8f5e9', color: '#1f8a4c', border: '#a5d6a7' },
+  '不通过': { bg: '#ffebee', color: '#eb5757', border: '#ffcdd2' },
+  '有条件通过': { bg: '#fff8e1', color: '#b8860b', border: '#ffe082' },
   '警告': { bg: '#fff8e1', color: '#b8860b', border: '#ffe082' },
   '阻断': { bg: '#ffebee', color: '#eb5757', border: '#ffcdd2' },
   '草稿': { bg: '#f3f6f9', color: '#667085', border: '#c8d6e5' },

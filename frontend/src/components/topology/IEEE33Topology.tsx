@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useEffect } from 'react';
 import { buses, lines, tieSwitches, faultScenarios, findBus, findLine, computeOutageBuses, computeRestoredBuses, computeOutageForNodeFault } from './topologyData';
 import type { BusNode, BranchLine, TieSwitchData } from './topologyTypes';
 import type { TieSwitchPath } from './topologyData';
@@ -36,6 +36,18 @@ export default function IEEE33Topology({ predictData, realtimeData }: { predictD
   const [selTies, setSelTies] = useState<Set<string>>(new Set());
   const [detail, setDetail] = useState<{ t: string; d: any; x: number; y: number } | null>(null);
   const [hoverId, setHoverId] = useState<string | null>(null);
+
+  // 保存故障线路到 localStorage 供后续页面使用
+  useEffect(() => {
+    if (faultLineIds.size > 0) {
+      const fid = Array.from(faultLineIds)[0];
+      const fl = findLine(fid);
+      if (fl) {
+        localStorage.setItem('current_fault_line', `${fl.fromNum}-${fl.toNum}`);
+        localStorage.setItem('current_fault_source', '拓扑图选择');
+      }
+    }
+  }, [faultLineIds]);
 
   // ========== 失电计算：合并线路故障 + 节点故障 ==========
   const outageBusIds = useMemo(() => {
@@ -286,7 +298,7 @@ export default function IEEE33Topology({ predictData, realtimeData }: { predictD
           {(tieSwitches as TieSwitchPath[]).map(tie => {
             const isSel = selTies.has(tie.id);
             const isAvail = availableTies.some(t => t.id === tie.id);
-            const c = isSel ? '#f1c40f' : isAvail ? '#ff9800' : '#e74c3c';
+            const c = isSel ? '#f1c40f' : isAvail ? '#2ecc71' : '#ffffff';
             const pts = tie.polyline.split(' ').map(p => p.split(',').map(Number));
             const m = pts[Math.floor(pts.length / 2)];
             return (
@@ -300,10 +312,10 @@ export default function IEEE33Topology({ predictData, realtimeData }: { predictD
                 <polyline points={tie.polyline} fill="none" stroke="transparent" strokeWidth={20}
                   onClick={e => { e.stopPropagation(); if (isAvail) applyTransfer(tie); else showPanel('tie', tie, e); }} />
                 <rect x={m[0] - 40} y={m[1] - 12} width={80} height={24} rx={4}
-                  fill={isSel ? '#f1c40f' : isAvail ? '#ff9800' : '#0a1622'}
+                  fill={isSel ? '#f1c40f' : isAvail ? '#2ecc71' : '#0a1622'}
                   stroke={c} strokeWidth={1} opacity={0.95} />
                 <text x={m[0]} y={m[1] + 3} textAnchor="middle"
-                  fill={isSel ? '#000' : c} fontSize={11} fontWeight={700}>
+                  fill={isSel ? '#000' : isAvail ? '#fff' : c} fontSize={11} fontWeight={700}>
                   {tie.name} {isAvail ? '可用' : ''}
                 </text>
               </g>
