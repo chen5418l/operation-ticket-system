@@ -25,7 +25,7 @@ export default function SideNav() {
   return (
     <nav style={{
       width: 'var(--sidebar-width)',
-      minWidth: 200,
+      minWidth: 220,
       background: '#f8fafb',
       borderRight: '1px solid #e2e8f0',
       paddingTop: 8,
@@ -46,10 +46,10 @@ export default function SideNav() {
             style={{
               display: 'flex',
               alignItems: 'center',
-              gap: 10,
+              gap: 8,
               height: 42,
-              padding: '0 16px',
-              margin: '2px 8px',
+              padding: '0 12px',
+              margin: '2px 6px',
               cursor: 'pointer',
               fontSize: 13,
               color: isActive ? '#1f8a4c' : '#1f2937',
@@ -58,10 +58,13 @@ export default function SideNav() {
               background: isActive ? '#e8f5e9' : 'transparent',
               borderLeft: isActive ? '3px solid #1f8a4c' : '3px solid transparent',
               fontWeight: isActive ? 600 : 400,
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
             }}
           >
-            <span style={{ fontSize: 16, flexShrink: 0 }}>{item.icon}</span>
-            <span>{item.label}</span>
+            <span style={{ fontSize: 15, flexShrink: 0, width: 20, textAlign: 'center' }}>{item.icon}</span>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.label}</span>
           </div>
         );
       })}

@@ -358,5 +358,28 @@ class FaultAnalyzeRealtimeRequest(BaseModel):
     fault_line: str = "8-9"
 
 
+class BoundaryAnalyzeRealtimeRequest(BaseModel):
+    action: str = "evaluate"            # scan: 风险筛查 only; evaluate: 执行边界判定
+    fault_line: Optional[str] = None    # evaluate 模式：直接指定故障线路（兼容旧版）
+    outage_nodes: list = []
+    source_node: int = 1
+    selected_risk_node: Optional[int] = None       # scan 模式：用户选中的风险节点
+    selected_related_line: Optional[str] = None    # evaluate 模式：用户确认的关联线路
+    risk_source: str = "realtime"       # realtime | forecast（预留给负荷预测）
+
+
 class TransferEvaluateRealtimeRequest(BaseModel):
     fault_line: str = "8-9"
+
+
+class TransferRecommendRealtimeRequest(BaseModel):
+    fault_line: str = "8-9"
+    outage_nodes: list = []
+    boundary_nodes: list = []
+    source_node: int = 1
+
+
+class SafetyValidateRealtimeRequest(BaseModel):
+    fault_line: str = "8-9"
+    candidate_tie_switch: str = ""
+    switching_plan: dict = {}

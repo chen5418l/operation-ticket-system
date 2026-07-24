@@ -35,6 +35,13 @@ const statusColors: Record<string, { bg: string; color: string; border: string }
   '正常': { bg: '#e8f5e9', color: '#1f8a4c', border: '#a5d6a7' },
   '已维护': { bg: '#e8f5e9', color: '#1f8a4c', border: '#a5d6a7' },
   '版本有效': { bg: '#e8f5e9', color: '#1f8a4c', border: '#a5d6a7' },
+  // 数据管理新增
+  '已加载': { bg: '#e8f5e9', color: '#1f8a4c', border: '#a5d6a7' },
+  '示例数据': { bg: '#fff8e1', color: '#b8860b', border: '#ffe082' },
+  '演示台账': { bg: '#fff8e1', color: '#b8860b', border: '#ffe082' },
+  '示例限值': { bg: '#fff8e1', color: '#b8860b', border: '#ffe082' },
+  '示例规则 v1.0': { bg: '#fff8e1', color: '#b8860b', border: '#ffe082' },
+  '启用': { bg: '#e8f5e9', color: '#1f8a4c', border: '#a5d6a7' },
 };
 
 export default function StatusBadge({ status }: Props) {

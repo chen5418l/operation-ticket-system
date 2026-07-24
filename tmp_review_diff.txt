@@ -1,0 +1,2389 @@
+warning: in the working copy of 'backend/.env.example', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/routers/realtime.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/main.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/src/pages/BoundaryJudgment.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/src/pages/Forecast.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/src/pages/TransferDecision.tsx', LF will be replaced by CRLF the next time Git touches it
+diff --git a/backend/.env.example b/backend/.env.example
+index d415d84..3343df8 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -9,3 +9,25 @@ BACKEND_PORT=8000
+ DATA_SOURCE_MODE=realtime
+ # Simulink/MATLAB 联调密钥 — 请和张同学约定一个复杂密钥
+ SIMULINK_SOURCE_TOKEN=your_simulink_token_here
++
++# ==================== 张同学外部算法服务适配器 ====================
++# 留空表示不启用该项桥接；填写完整 URL 后端点会自动尝试调用并降级
++ALGO_FORECAST_URL=
++ALGO_FAULT_ANALYZE_URL=
++ALGO_BOUNDARY_ANALYZE_URL=
++ALGO_TRANSFER_RECOMMEND_URL=
++ALGO_SAFETY_VALIDATE_URL=
++# 外部算法调用超时（秒），默认 5
++ALGO_TIMEOUT_SECONDS=5
++
++# ==================== IEEE33 算法服务正式接口适配器 ====================
++# 基于《IEEE33 算法服务正式接口清单》，单入口 + 算法密钥认证
++# X-Algorithm-Key 仅用于调用算法业务接口，与 Simulink 推送的 X-Simulink-Token 完全隔离
++# 优先使用 ALGO_SERVICE_BASE_URL / ALGO_SERVICE_KEY（张同学文档约定键名）
++# 也兼容旧键名 ALGO_BASE_URL / ALGORITHM_KEY 作为回退
++ALGO_SERVICE_BASE_URL=http://100.73.79.86:8010
++ALGO_SERVICE_KEY=
++ALGO_TIMEOUT_MS=5000
++ALGO_JOB_POLL_INTERVAL_MS=1000
++ALGO_JOB_MAX_WAIT_MS=180000
++ALGO_JOB_TIMEOUT_MS=20000
+diff --git a/backend/app/routers/realtime.py b/backend/app/routers/realtime.py
+index d0dff00..50e9929 100644
+--- a/backend/app/routers/realtime.py
++++ b/backend/app/routers/realtime.py
+@@ -358,5 +358,24 @@ class FaultAnalyzeRealtimeRequest(BaseModel):
+     fault_line: str = "8-9"
+ 
+ 
++class BoundaryAnalyzeRealtimeRequest(BaseModel):
++    fault_line: str = "8-9"
++    outage_nodes: list = []
++    source_node: int = 1
++
++
+ class TransferEvaluateRealtimeRequest(BaseModel):
+     fault_line: str = "8-9"
++
++
++class TransferRecommendRealtimeRequest(BaseModel):
++    fault_line: str = "8-9"
++    outage_nodes: list = []
++    boundary_nodes: list = []
++    source_node: int = 1
++
++
++class SafetyValidateRealtimeRequest(BaseModel):
++    fault_line: str = "8-9"
++    candidate_tie_switch: str = ""
++    switching_plan: dict = {}
+diff --git a/backend/main.py b/backend/main.py
+index 8aed9c9..8025e45 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -10,7 +10,8 @@ from pydantic import BaseModel
+ from app.core.database import init_db
+ from app.routers import topology, fault, transfer, safety, ticket, health, safety_checker, realtime
+ from app.routers import realtime as realtime_module
+-from app.routers.realtime import ForecastRealtimeRequest, FaultAnalyzeRealtimeRequest, TransferEvaluateRealtimeRequest
++from app.routers.realtime import ForecastRealtimeRequest, FaultAnalyzeRealtimeRequest, TransferEvaluateRealtimeRequest, BoundaryAnalyzeRealtimeRequest, TransferRecommendRealtimeRequest, SafetyValidateRealtimeRequest
++from app.services.algorithm_client import AlgoCallResult
+ 
+ app = FastAPI(
+     title="国网江苏市级配电网智能成票与安全校验系统",
+@@ -102,9 +103,162 @@ def _external_score_expired(ext: dict) -> bool:
+ 
+ # ==================== 实时预测 + 故障分析（使用实时数据）====================
+ 
++def _build_local_forecast(data, nodes, horizon, interval, base_hour, base_time, forecast_mode, time_source, warnings):
++    """本地规则版源荷预测（日负荷系数 × 风险因子 × 电压因子），供外部算法不可用时兜底"""
++    HOURLY_LOAD = {0:0.78,1:0.75,2:0.73,3:0.72,4:0.74,5:0.80,6:0.88,7:0.96,8:1.02,9:1.05,10:1.08,11:1.10,12:1.06,13:1.03,14:1.00,15:1.02,16:1.08,17:1.15,18:1.22,19:1.20,20:1.14,21:1.05,22:0.95,23:0.85}
++    HOURLY_PV   = {0:0.00,1:0.00,2:0.00,3:0.00,4:0.00,5:0.05,6:0.15,7:0.35,8:0.55,9:0.75,10:0.90,11:1.00,12:1.00,13:0.92,14:0.80,15:0.65,16:0.45,17:0.20,18:0.05,19:0.00,20:0.00,21:0.00,22:0.00,23:0.00}
++    HOURLY_EV   = {0:0.60,1:0.55,2:0.50,3:0.45,4:0.45,5:0.50,6:0.60,7:0.75,8:0.85,9:0.80,10:0.75,11:0.70,12:0.75,13:0.78,14:0.80,15:0.85,16:0.95,17:1.15,18:1.35,19:1.45,20:1.40,21:1.25,22:1.05,23:0.80}
++    def lf(h): return HOURLY_LOAD.get(h % 24, 1.0)
++    def pf(h): return HOURLY_PV.get(h % 24, 0.0)
++    def ef(h): return HOURLY_EV.get(h % 24, 1.0)
++    def rf(r): return {"low": 1.00, "medium": 1.03, "high": 1.06}.get(r, 1.00)
++    def vf(v): return 1.05 if v < 0.95 else (1.02 if v < 0.97 else 1.00)
++    cur_load = round(sum(n.get("load_kw", 0) for n in nodes), 3)
++    cur_pv = round(sum(n.get("pv_kw", 0) for n in nodes), 3)
++    cur_ev = round(sum(n.get("ev_kw", 0) for n in nodes), 3)
++    node_forecasts = []
++    for n in nodes:
++        nd = n.get("node", 0); v = n.get("voltage_pu", 1.0); rl = n.get("risk_level", "low")
++        l0, pv0, ev0 = n.get("load_kw", 0), n.get("pv_kw", 0), n.get("ev_kw", 0)
++        series = []
++        for s in range(1, horizon + 1):
++            fh = (base_hour + s * interval // 60) % 24; t_off = s * interval
++            fl = round(l0 * lf(fh) * rf(rl) * vf(v), 3)
++            fp = round(pv0 * pf(fh), 3); fe = round(ev0 * ef(fh), 3)
++            series.append({"step": s, "time_offset_min": t_off, "forecast_hour": fh,
++                           "forecast_load_kw": fl, "forecast_pv_kw": fp, "forecast_ev_kw": fe,
++                           "forecast_net_load_kw": round(fl + fe - fp, 3)})
++        node_forecasts.append({"node": nd, "current_load_kw": l0, "current_pv_kw": pv0,
++                               "current_ev_kw": ev0, "current_net_load_kw": round(l0 + ev0 - pv0, 3),
++                               "voltage_pu": v, "risk_level": rl, "series": series})
++    forecast_series = []
++    for s in range(1, horizon + 1):
++        fh = (base_hour + s * interval // 60) % 24; t_off = s * interval
++        tl = round(sum(n.get("load_kw",0)*lf(fh)*rf(n.get("risk_level","low"))*vf(n.get("voltage_pu",1.0)) for n in nodes), 3)
++        tp = round(sum(n.get("pv_kw",0)*pf(fh) for n in nodes), 3)
++        te = round(sum(n.get("ev_kw",0)*ef(fh) for n in nodes), 3)
++        forecast_series.append({"step": s, "time_offset_min": t_off, "forecast_hour": fh,
++                                "total_load_kw": tl, "total_pv_kw": tp, "total_ev_kw": te,
++                                "total_net_load_kw": round(tl+te-tp, 3)})
++    # 风险节点：净负荷峰值增长率 > 10% 或电压 < 0.97
++    risk_nodes = []
++    for nf in node_forecasts:
++        max_net = max((s["forecast_net_load_kw"] for s in nf["series"]), default=nf["current_net_load_kw"])
++        r = nf["risk_level"]
++        if r == "high" or r == "medium" or nf["voltage_pu"] < 0.97 or (
++           nf["current_net_load_kw"] > 0 and (max_net - nf["current_net_load_kw"]) / max(nf["current_net_load_kw"], 1) > 0.1):
++            risk_nodes.append({"node": nf["node"], "risk_level": r, "voltage_pu": nf["voltage_pu"],
++                               "current_net_load_kw": nf["current_net_load_kw"], "peak_net_load_kw": max_net})
++    return {
++        "success": True, "has_data": True,
++        "algorithm_source": "local_fallback",
++        "confidence": "low",
++        "source": "realtime",
++        "source_tag": realtime_module._latest_source or "none",
++        "trusted_source": realtime_module._latest_trusted or False,
++        "timestamp": data.get("timestamp", "") or (realtime_module._last_update or ""),
++        "base_time": base_time, "base_hour": base_hour,
++        "forecast_mode": forecast_mode, "time_source": time_source,
++        "horizon": horizon, "interval_minutes": interval,
++        "message": "本地规则版源荷预测（未接入外部预测算法，结果需人工复核）",
++        "current_total_load_kw": cur_load,
++        "current_total_pv_kw": cur_pv,
++        "current_total_ev_kw": cur_ev,
++        "current_total_net_load_kw": round(cur_load + cur_ev - cur_pv, 3),
++        "forecast_series": forecast_series, "node_forecasts": node_forecasts,
++        "risk_nodes": risk_nodes,
++        "diagnostics": {
++            "realtime_node_count": len(nodes),
++            "realtime_total_load_kw": cur_load, "realtime_total_pv_kw": cur_pv,
++            "realtime_total_ev_kw": cur_ev, "used_realtime_nodes": True,
++            "used_static_fallback": False,
++            "field_check": {"has_pv_kw": cur_pv > 0, "has_ev_kw": cur_ev > 0},
++        },
++        "warnings": warnings,
++    }
++
++
++def compute_time_index(ts: Optional[str] = None) -> int:
++    """一天 288 点（5分钟粒度），范围 1~288。公式: floor((h*60+m)/5) + 1"""
++    if ts:
++        for f in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S", "%H:%M"):
++            try: dt = datetime.strptime(str(ts).strip(), f); break
++            except ValueError: pass
++        else: dt = datetime.now()
++    else:
++        dt = datetime.now()
++    return (dt.hour * 60 + dt.minute) // 5 + 1
++
++
++def _map_forecast_risk_level(level: str) -> str:
++    """外部算法 risk_level: High/Medium → high/medium/low"""
++    v = str(level or "").strip().lower()
++    return v if v in ("high", "medium", "low") else "low"
++
++
++def _normalize_external_forecast(ext: dict, nodes: list, warnings: list) -> dict:
++    """将 IEEE33 算法服务 /api/v1/forecast/realtime 返回值标准化为业务前端结构"""
++    ext_ts = ext.get("timestamp") or realtime_module._last_update or ""
++
++    # forecast_series：兼容 forecasts[] 包裹结构
++    series = ext.get("forecast_series") or ext.get("series") or []
++    if not series and isinstance(ext.get("forecasts"), list):
++        series = ext["forecasts"]
++
++    # node_forecasts：兼容 forecasts[].nodes[] 扁平化
++    node_fcasts = ext.get("node_forecasts") or []
++    if not node_fcasts and isinstance(ext.get("forecasts"), list):
++        flat = []
++        for f in ext["forecasts"]:
++            for n in (f.get("nodes") or []):
++                flat.append({
++                    "node": n.get("node") or n.get("bus", 0),
++                    "forecast_hour": f.get("forecast_hour") or f.get("step", 0),
++                    "forecast_load_kw": n.get("p_load_kw") or n.get("forecast_load_kw", 0),
++                    "forecast_pv_kw": n.get("p_pv_kw") or n.get("forecast_pv_kw", 0),
++                    "forecast_ev_kw": n.get("p_ev_kw") or n.get("forecast_ev_kw", 0),
++                    "forecast_net_load_kw": (n.get("p_load_kw") or n.get("forecast_load_kw", 0))
++                                           + (n.get("p_ev_kw") or n.get("forecast_ev_kw", 0))
++                                           - (n.get("p_pv_kw") or n.get("forecast_pv_kw", 0)),
++                })
++        node_fcasts = flat
++
++    # risk_nodes：标准化 risk_level + reasons → risk_reason
++    risk = ext.get("risk_nodes") or ext.get("risk_nodes_list") or []
++    norm_risk = []
++    for rn in risk:
++        nr = dict(rn)
++        nr["risk_level"] = _map_forecast_risk_level(nr.get("risk_level", "low"))
++        reasons = nr.get("reasons") or nr.get("risk_reason") or []
++        if isinstance(reasons, str):
++            reasons = [reasons]
++        nr["risk_reason"] = reasons
++        norm_risk.append(nr)
++
++    cur_load = ext.get("current_total_load_kw") or round(sum(n.get("load_kw",0) for n in nodes), 3)
++
++    return {
++        "success": True, "has_data": True,
++        "algorithm_source": "external",
++        "algorithm": ext.get("algorithm") or "ieee33",
++        "algorithm_version": ext.get("algorithm_version") or "",
++        "trusted_source": realtime_module._latest_trusted or False,
++        "timestamp": ext_ts,
++        "current_total_load_kw": cur_load,
++        "current_total_pv_kw": ext.get("current_total_pv_kw", 0),
++        "current_total_ev_kw": ext.get("current_total_ev_kw", 0),
++        "current_total_net_load_kw": ext.get("current_total_net_load_kw") or (cur_load + ext.get("current_total_ev_kw", 0) - ext.get("current_total_pv_kw", 0)),
++        "forecast_series": series,
++        "node_forecasts": node_fcasts,
++        "risk_nodes": norm_risk,
++        "message": "基于 IEEE33 算法服务完成源荷预测",
++        "warnings": warnings,
++    }
++
++
+ @app.post("/api/forecast/realtime")
+ def forecast_realtime(req: ForecastRealtimeRequest):
+-    """基于实时 Simulink 数据做多步源荷预测"""
++    """源荷预测统一接口：优先调用 IEEE33 算法服务 POST /api/v1/forecast/realtime"""
+     data = realtime_module._latest_data
+     if data is None or not data.get("nodes"):
+         return {
+@@ -122,17 +276,11 @@ def forecast_realtime(req: ForecastRealtimeRequest):
+     # ---- 基准时间解析 ----
+     horizon = max(1, min(48, getattr(req, 'horizon_hours', 0) or req.horizon))
+     interval = max(5, min(120, req.interval_minutes))
+-
+     ts_str = realtime_module._last_update or ""
+-    base_time = ""
+-    time_source = "server_time"
+-    forecast_mode = "realtime"
+-
++    base_time, time_source, forecast_mode = "", "server_time", "realtime"
+     if req.base_hour >= 0:
+-        base_hour = req.base_hour % 24
+-        base_time = f"{base_hour:02d}:00"
+-        time_source = "manual_override"
+-        forecast_mode = "scenario"
++        base_hour = req.base_hour % 24; base_time = f"{base_hour:02d}:00"
++        time_source = "manual_override"; forecast_mode = "scenario"
+     elif ts_str:
+         try:
+             for fmt_str in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S", "%H:%M"):
+@@ -140,167 +288,58 @@ def forecast_realtime(req: ForecastRealtimeRequest):
+                     dt = datetime.strptime(ts_str.strip(), fmt_str)
+                     base_hour = dt.hour
+                     base_time = dt.strftime("%Y-%m-%d %H:%M:%S") if dt.year > 2000 else dt.strftime("%H:%M:%S")
+-                    time_source = "realtime_timestamp"
+-                    break
+-                except ValueError:
+-                    continue
++                    time_source = "realtime_timestamp"; break
++                except ValueError: continue
+             else:
+                 base_hour = datetime.now().hour; base_time = datetime.now().strftime("%H:%M:%S")
+         except Exception:
+             base_hour = datetime.now().hour; base_time = datetime.now().strftime("%H:%M:%S")
+     else:
+         base_hour = datetime.now().hour; base_time = datetime.now().strftime("%H:%M:%S")
+-
+     base_hour = base_hour % 24
+ 
+-    # ---- 24小时日负荷系数 ----
+-    HOURLY_LOAD = {0:0.78,1:0.75,2:0.73,3:0.72,4:0.74,5:0.80,6:0.88,7:0.96,8:1.02,9:1.05,10:1.08,11:1.10,12:1.06,13:1.03,14:1.00,15:1.02,16:1.08,17:1.15,18:1.22,19:1.20,20:1.14,21:1.05,22:0.95,23:0.85}
+-    HOURLY_PV   = {0:0.00,1:0.00,2:0.00,3:0.00,4:0.00,5:0.05,6:0.15,7:0.35,8:0.55,9:0.75,10:0.90,11:1.00,12:1.00,13:0.92,14:0.80,15:0.65,16:0.45,17:0.20,18:0.05,19:0.00,20:0.00,21:0.00,22:0.00,23:0.00}
+-    HOURLY_EV   = {0:0.60,1:0.55,2:0.50,3:0.45,4:0.45,5:0.50,6:0.60,7:0.75,8:0.85,9:0.80,10:0.75,11:0.70,12:0.75,13:0.78,14:0.80,15:0.85,16:0.95,17:1.15,18:1.35,19:1.45,20:1.40,21:1.25,22:1.05,23:0.80}
+-
+-    def load_factor_for_hour(h: int) -> float: return HOURLY_LOAD.get(h % 24, 1.0)
+-    def pv_factor_for_hour(h: int) -> float: return HOURLY_PV.get(h % 24, 0.0)
+-    def ev_factor_for_hour(h: int) -> float: return HOURLY_EV.get(h % 24, 1.0)
+-
+-    def risk_factor(risk: str) -> float:
+-        m = {"low": 1.00, "medium": 1.03, "high": 1.06}
+-        return m.get(risk, 1.00)
+-
+-    def voltage_factor(v: float) -> float:
+-        if v < 0.95:
+-            return 1.05
+-        elif v < 0.97:
+-            return 1.02
+-        return 1.00
+-
+-    # ---- 当前汇总 ----
+-    cur_load = round(sum(n.get("load_kw", 0) for n in nodes), 3)
+-    cur_pv = round(sum(n.get("pv_kw", 0) for n in nodes), 3)
+-    cur_ev = round(sum(n.get("ev_kw", 0) for n in nodes), 3)
+-    cur_net = round(cur_load + cur_ev - cur_pv, 3)
+-
+-    # ---- 逐节点 + 全网预测 ----
+-    node_forecasts = []
+-    for n in nodes:
+-        nd = n.get("node", 0)
+-        v = n.get("voltage_pu", 1.0)
+-        risk = n.get("risk_level", "low")
+-        l0 = n.get("load_kw", 0)
+-        pv0 = n.get("pv_kw", 0)
+-        ev0 = n.get("ev_kw", 0)
+-        vf = voltage_factor(v)
+-        rf = risk_factor(risk)
+-        series = []
+-        for s in range(1, horizon + 1):
+-            fh = (base_hour + s * interval // 60) % 24
+-            t_off = s * interval
+-            ltf = load_factor_for_hour(fh)
+-            ptf = pv_factor_for_hour(fh)
+-            etf = ev_factor_for_hour(fh)
+-            fl = round(l0 * ltf * rf * vf, 3)
+-            fp = round(pv0 * ptf, 3)
+-            fe = round(ev0 * etf, 3)
+-            series.append({
+-                "step": s, "time_offset_min": t_off, "forecast_hour": fh,
+-                "forecast_load_kw": fl, "forecast_pv_kw": fp, "forecast_ev_kw": fe,
+-                "forecast_net_load_kw": round(fl + fe - fp, 3),
+-            })
+-        node_forecasts.append({
+-            "node": nd,
+-            "current_load_kw": l0, "current_pv_kw": pv0,
+-            "current_ev_kw": ev0, "current_net_load_kw": round(l0 + ev0 - pv0, 3),
+-            "voltage_pu": v, "risk_level": risk, "series": series,
+-        })
+-
+-    # ---- 全网预测序列 ----
+-    forecast_series = []
+-    for s in range(1, horizon + 1):
+-        fh = (base_hour + s * interval // 60) % 24
+-        t_off = s * interval
+-        ltf = load_factor_for_hour(fh)
+-        ptf = pv_factor_for_hour(fh)
+-        etf = ev_factor_for_hour(fh)
+-        tl = round(sum(n.get("load_kw",0)*ltf*risk_factor(n.get("risk_level","low"))*voltage_factor(n.get("voltage_pu",1.0)) for n in nodes),3)
+-        tp = round(sum(n.get("pv_kw",0)*ptf for n in nodes),3)
+-        te = round(sum(n.get("ev_kw",0)*etf for n in nodes),3)
+-        forecast_series.append({
+-            "step": s, "time_offset_min": t_off, "forecast_hour": fh,
+-            "total_load_kw": tl, "total_pv_kw": tp, "total_ev_kw": te,
+-            "total_net_load_kw": round(tl+te-tp,3),
+-        })
+-
+-    return {
+-        "success": True, "has_data": True,
+-        "source": "realtime",
+-        "source_tag": realtime_module._latest_source or "none",
+-        "trusted_source": realtime_module._latest_trusted or False,
+-        "timestamp": data.get("timestamp", ""),
+-        "base_time": base_time,
+-        "base_hour": base_hour,
+-        "forecast_mode": forecast_mode,
+-        "time_source": time_source,
+-        "horizon": horizon, "interval_minutes": interval,
+-        "message": "基于 Simulink 实时数据完成24小时源荷预测" if forecast_mode == "realtime" else "场景推演模式：基准时间由用户手动指定",
+-        "current_total_load_kw": cur_load,
+-        "current_total_pv_kw": cur_pv,
+-        "current_total_ev_kw": cur_ev,
+-        "current_total_net_load_kw": cur_net,
+-        "forecast_series": forecast_series,
+-        "node_forecasts": node_forecasts,
+-        "diagnostics": {
+-            "realtime_node_count": len(nodes),
+-            "realtime_total_load_kw": cur_load,
+-            "realtime_total_pv_kw": cur_pv,
+-            "realtime_total_ev_kw": cur_ev,
+-            "used_realtime_nodes": True,
+-            "used_static_fallback": False,
+-            "field_check": {"has_pv_kw": cur_pv > 0, "has_ev_kw": cur_ev > 0},
++    # ---- IEEE33 算法服务桥接：源荷预测 ----
++    from app.services.ieee33_algorithm_client import forecastRealtime as algo_forecast
++    ti = compute_time_index(ts_str)
++    algo_payload = {
++        "request_id": f"fcst_{datetime.now().strftime('%Y%m%d%H%M%S')}",
++        "timestamp": ts_str,
++        "time_index": ti,
++        "horizon_steps": horizon,
++        "step_minutes": interval,
++        "include_risk": True,
++        "snapshot": {
++            "timestamp": ts_str,
++            "time_index": ti,
++            "nodes": nodes,
++            "lines": data.get("lines", []),
++            "switches": data.get("switches", {}),
+         },
+-        "warnings": warnings,
+     }
++    algo_result = algo_forecast(algo_payload)
++    if algo_result.available and algo_result.ok:
++        normalized = _normalize_external_forecast(algo_result.data, nodes, warnings)
++        normalized["diagnostics"] = {**algo_result.to_dict(), "algorithm_source": "external"}
++        return normalized
++
++    # ---- 本地规则兜底（未配置或外部调用失败均走此路径）----
++    if algo_result.available is not None and not algo_result.available and algo_result.error == "not_configured":
++        warnings.append("外部预测算法接口暂未接入，当前使用本地规则预测，结果需人工复核")
++    else:
++        warnings.append("外部预测算法服务暂不可用，已降级本地规则预测，结果需人工复核")
++    return _build_local_forecast(data, nodes, horizon, interval, base_hour, base_time,
++                                  forecast_mode, time_source, warnings)
+ 
+ 
+-@app.post("/api/fault/analyze-realtime")
+-def fault_analyze_realtime(req: FaultAnalyzeRealtimeRequest):
+-    """
+-    基于实时 Simulink 数据做 IEEE 33节点 BFS 故障分析。
+-    lines[].line 格式 "13-14" 解析 from/to；
+-    lines[].status 判断闭合/断开。
+-    """
+-    data = realtime_module._latest_data
+-    if data is None or not data.get("nodes"):
+-        return {
+-            "success": False,
+-            "has_data": False,
+-            "message": "暂无实时数据，请先接入Simulink数据",
+-            "warnings": ["暂无实时数据，请先接入Simulink数据"],
+-        }
+-
+-    nodes = data.get("nodes", [])
+-    lines_data = data.get("lines", [])
+-    fault_str = req.fault_line.strip()
+-    src_tag = realtime_module._latest_source or "none"
+-    trusted = realtime_module._latest_trusted or False
++def _run_local_fault_bfs(data, nodes, lines_data, fault_key, src_tag, trusted, warnings, parse_errors):
++    """本地 BFS 故障分析（拓扑兜底）。algorithm_source=local_fallback"""
+     node_map = {n.get("node", 0): n for n in nodes}
+-
+-    # 校验并归一化 fault_line（"9-8" 与 "8-9" 等价）
+-    if parse_line_pair(fault_str) is None:
+-        return {"success": False, "message": f"故障线路格式非法: {fault_str}，需为数字-数字"}
+-    fault_key = normalize_line_key(fault_str)
+-
+-    warnings = []
+-    parse_errors = []
+-    if not trusted:
+-        warnings.append("当前数据源未验证，结果需人工复核")
+-
+     # ---- 构建邻接表 ----
+     adj = {}
+     all_pairs = set()
+     tie_candidates = []
+-
+     for l in lines_data:
+-        ln = l.get("line", "")
+-        st = l.get("status", 1)
++        ln = l.get("line", ""); st = l.get("status", 1)
+         pair = parse_line_pair(ln)
+         if pair is None:
+             parse_errors.append(f"无法解析线路: {ln}")
+@@ -308,147 +347,571 @@ def fault_analyze_realtime(req: FaultAnalyzeRealtimeRequest):
+         key = f"{pair[0]}-{pair[1]}"
+         all_pairs.add(pair)
+         if key == fault_key:
+-            # 故障线路本身：从基础图中断开，且不得作为联络候选
+-            continue
++            continue  # 故障线路本身断开
+         if st == 0:
+             tie_candidates.append({**l, "line": key})
+         if st == 1:
+             aid, bid = f"BUS-{pair[0]:02d}", f"BUS-{pair[1]:02d}"
+-            adj.setdefault(aid, []).append(bid)
+-            adj.setdefault(bid, []).append(aid)
+-
++            adj.setdefault(aid, []).append(bid); adj.setdefault(bid, []).append(aid)
+     if parse_errors:
+         warnings.extend(parse_errors[:5])
+ 
+-    # ---- BFS 从 BUS-01 ----
+-    visited = set()
+-    queue = ["BUS-01"]
+-    while queue:
+-        u = queue.pop(0)
+-        if u in visited:
+-            continue
++    # ---- BFS ----
++    visited = set(); q = ["BUS-01"]
++    while q:
++        u = q.pop(0)
++        if u in visited: continue
+         visited.add(u)
+         for v in adj.get(u, []):
+-            if v not in visited:
+-                queue.append(v)
++            if v not in visited: q.append(v)
+ 
+     all_ids = {f"BUS-{n.get('node', 0):02d}" for n in nodes}
+-    outage = sorted(all_ids - visited)
+-    powered = sorted(visited)
+-    outage_nums = [int(x.replace("BUS-", "")) for x in outage]
+-    reachable_nums = [int(x.replace("BUS-", "")) for x in powered]
++    outage_nums = [int(x.replace("BUS-", "")) for x in sorted(all_ids - visited)]
++    reachable_nums = [int(x.replace("BUS-", "")) for x in sorted(visited)]
+ 
+-    # ---- 边界节点 + 边界边 ----
++    # ---- 边界 ----
+     boundary_nodes = []
+     boundary_edges = []
+     for (a, b) in all_pairs:
+-        a_live = a in reachable_nums
+-        b_live = b in reachable_nums
++        a_live, b_live = a in reachable_nums, b in reachable_nums
+         if a_live != b_live:
+             boundary_nodes.append(f"{a}-{b}")
+-            boundary_edges.append({
+-                "line": f"{a}-{b}",
+-                "source_side": a if a_live else b,
+-                "outage_side": b if a_live else a,
+-            })
++            boundary_edges.append({"line": f"{a}-{b}", "source_side": a if a_live else b, "outage_side": b if a_live else a})
+ 
+-    # ---- 候选联络开关（已排除故障线路本身）----
++    # ---- 候选联络开关 ----
+     candidate_tie_switches = []
+-    seen_tie_keys = set()
++    seen = set()
+     for l in tie_candidates:
+         ln = l.get("line", "")
+         pair = parse_line_pair(ln)
+-        if pair is None or ln in seen_tie_keys:
+-            continue
+-        seen_tie_keys.add(ln)
++        if pair is None or ln in seen: continue
++        seen.add(ln)
+         an, bn = pair
+-        a_live = an in reachable_nums
+-        b_live = bn in reachable_nums
+-        if a_live != b_live:
++        if (an in reachable_nums) != (bn in reachable_nums):
+             candidate_tie_switches.append({
+-                "line": ln,
+-                "from": an, "to": bn,
+-                "status": l.get("status", 0),
+-                "current_a": l.get("current_a", 0),
+-                "power_kw": l.get("power_kw", 0),
++                "line": ln, "from": an, "to": bn, "status": l.get("status", 0),
++                "current_a": l.get("current_a", 0), "power_kw": l.get("power_kw", 0),
+                 "reason": "该联络线连接带电区域与停电区域，可作为转供候选",
+             })
+ 
+-    # ---- 负荷 ----
+-    current_total_load_kw = round(sum(n.get("load_kw", 0) for n in nodes), 2)
+-    affected_load_kw = round(sum(
+-        node_map.get(nid, {}).get("load_kw", 0) for nid in outage_nums
+-    ), 2)
++    current_total = round(sum(n.get("load_kw", 0) for n in nodes), 2)
++    affected_load = round(sum(node_map.get(nid, {}).get("load_kw", 0) for nid in outage_nums), 2)
+ 
+-    # ---- 潮流摘要 ----
+     voltages = [n.get("voltage_pu", 1.0) for n in nodes]
+     min_v = min(voltages) if voltages else 0
+     max_v = max(voltages) if voltages else 0
+-    min_v_node = nodes[voltages.index(min_v)].get("node", 0) if voltages else 0
+-    max_v_node = nodes[voltages.index(max_v)].get("node", 0) if voltages else 0
+ 
+-    max_current, max_current_line = 0.0, ""
+-    max_power, max_power_line = 0.0, ""
+-    for l in lines_data:
+-        ca = abs(l.get("current_a", 0) or 0)
+-        pk = abs(l.get("power_kw", 0) or 0)
+-        if ca > max_current:
+-            max_current, max_current_line = ca, l.get("line", "")
+-        if pk > max_power:
+-            max_power, max_power_line = pk, l.get("line", "")
+-
+-    power_flow_summary = {
+-        "min_voltage_pu": round(min_v, 4),
+-        "min_voltage_node": min_v_node,
+-        "max_voltage_pu": round(max_v, 4),
+-        "max_voltage_node": max_v_node,
+-        "max_current_a": round(max_current, 2),
+-        "max_current_line": max_current_line,
+-        "max_power_kw": round(max_power, 2),
+-        "max_power_line": max_power_line,
+-        "total_load_kw": current_total_load_kw,
+-        "affected_load_kw": affected_load_kw,
++    return {
++        "success": True, "has_data": True,
++        "algorithm_source": "local_fallback",
++        "source": "realtime", "source_tag": src_tag, "trusted_source": trusted,
++        "timestamp": data.get("timestamp", "") or (realtime_module._last_update or ""),
++        "message": "本地 BFS 拓扑分析（仅为拓扑兜底，外部故障分析算法未配置；结果需人工复核）",
++        "fault_line": fault_key, "source_node": 1,
++        "reachable_nodes": reachable_nums, "outage_nodes": outage_nums,
++        "boundary_nodes": boundary_nodes, "boundary_edges": boundary_edges,
++        "candidate_tie_switches": candidate_tie_switches,
++        "current_total_load_kW": current_total, "affected_load_kW": affected_load,
++        "affected_count": len(outage_nums), "reachable_count": len(reachable_nums),
++        "powered_nodes": reachable_nums,
++        "affected_node_details": [
++            {"node": nid, "load_kw": node_map.get(nid, {}).get("load_kw", 0),
++             "voltage_pu": node_map.get(nid, {}).get("voltage_pu", 0),
++             "pv_kw": node_map.get(nid, {}).get("pv_kw", 0),
++             "ev_kw": node_map.get(nid, {}).get("ev_kw", 0),
++             "risk_level": node_map.get(nid, {}).get("risk_level", "low")}
++            for nid in outage_nums
++        ],
++        "power_flow_summary": {
++            "min_voltage_pu": round(min_v, 4), "min_voltage_node": voltages.index(min_v) + 1 if voltages else 0,
++            "max_voltage_pu": round(max_v, 4), "max_voltage_node": voltages.index(max_v) + 1 if voltages else 0,
++        },
++        "diagnostics": {"algorithm_source": "local_fallback"},
++        "warnings": warnings,
+     }
+ 
+-    # ---- 失电节点详情 ----
+-    details = []
+-    for nid in outage_nums:
+-        n = node_map.get(nid, {})
+-        details.append({
+-            "node": nid,
+-            "load_kw": n.get("load_kw", 0),
+-            "voltage_pu": n.get("voltage_pu", 0),
+-            "pv_kw": n.get("pv_kw", 0),
+-            "ev_kw": n.get("ev_kw", 0),
+-            "risk_level": n.get("risk_level", "low"),
+-        })
++
++@app.post("/api/fault/analyze-realtime")
++def fault_analyze_realtime(req: FaultAnalyzeRealtimeRequest):
++    """故障分析统一接口：外部算法优先，不可用时按是否配置分流"""
++    data = realtime_module._latest_data
++    if data is None or not data.get("nodes"):
++        return {
++            "success": False, "has_data": False,
++            "message": "暂无实时数据，请先接入Simulink数据",
++            "warnings": ["暂无实时数据，请先接入Simulink数据"],
++        }
++
++    nodes = data.get("nodes", [])
++    lines_data = data.get("lines", [])
++    fault_str = req.fault_line.strip()
++    src_tag = realtime_module._latest_source or "none"
++    trusted = realtime_module._latest_trusted or False
++    node_map = {n.get("node", 0): n for n in nodes}
++
++    if parse_line_pair(fault_str) is None:
++        return {"success": False, "message": f"故障线路格式非法: {fault_str}，需为数字-数字"}
++    fault_key = normalize_line_key(fault_str)
++
++    warnings = []
++    parse_errors = []
++    if not trusted:
++        warnings.append("当前数据源未验证，结果需人工复核")
++
++    # ---- IEEE33 算法服务桥接：故障分析 ----
++    from app.services.ieee33_algorithm_client import faultAnalyze as algo_fault_analyze
++    algo_result = algo_fault_analyze({
++        "request_id": f"fault_{datetime.now().strftime('%Y%m%d%H%M%S')}",
++        "fault_line": fault_key,
++        "timestamp": realtime_module._last_update or "",
++        "snapshot": {"nodes": nodes, "lines": lines_data, "switches": data.get("switches", {})},
++    })
++    if algo_result.available and algo_result.ok:
++        ext = algo_result.data
++        # 标准化字段：fault_analysis.dead_buses → outage_nodes；fault_analysis.outage_nodes → outage_nodes
++        fa = ext.get("fault_analysis") or {}
++        outage_raw = (ext.get("outage_nodes") or fa.get("outage_nodes") or
++                      fa.get("dead_buses") or ext.get("dead_buses") or [])
++        if isinstance(outage_raw, list) and outage_raw:
++            outage_nums = [int(x) for x in outage_raw]
++            reachable_nums = [i for i in range(1, 34) if i not in outage_nums]
++            affected_load = ext.get("affected_load_kw") or fa.get("affected_load_kw") or round(
++                sum(node_map.get(nid, {}).get("load_kw", 0) for nid in outage_nums), 2)
++            cur_total = round(sum(n.get("load_kw", 0) for n in nodes), 2)
++            # 候选联络开关标准化
++            cands = (ext.get("candidate_tie_switches") or fa.get("candidate_tie_switches") or
++                     ext.get("candidates") or [])
++            candidate_tie_switches = []
++            for tc in cands:
++                tl = tc.get("line") or tc.get("tie_line") or ""
++                pair = parse_line_pair(str(tl))
++                if pair:
++                    candidate_tie_switches.append({
++                        "line": f"{pair[0]}-{pair[1]}", "from": pair[0], "to": pair[1],
++                        "status": tc.get("status", 0),
++                        "current_a": tc.get("current_a") or tc.get("current", 0),
++                        "power_kw": tc.get("power_kw") or tc.get("power", 0),
++                        "reason": tc.get("reason", "外部算法推荐"),
++                    })
++            return {
++                "success": True, "has_data": True,
++                "algorithm_source": "external",
++                "source": "realtime", "source_tag": src_tag, "trusted_source": trusted,
++                "timestamp": ext.get("timestamp") or realtime_module._last_update or "",
++                "message": "基于 IEEE33 算法服务完成故障分析",
++                "fault_line": fault_key,
++                "fault_analysis": fa,
++                "outage_nodes": outage_nums,
++                "dead_buses": fa.get("dead_buses") or outage_nums,
++                "affected_load_kW": affected_load,
++                "service_interruption": ext.get("service_interruption") or fa.get("service_interruption") or False,
++                "affected_count": len(outage_nums),
++                "reachable_nodes": reachable_nums, "reachable_count": len(reachable_nums),
++                "powered_nodes": reachable_nums,
++                "boundary_nodes": ext.get("boundary_nodes") or [],
++                "boundary_edges": ext.get("boundary_edges") or [],
++                "candidate_tie_switches": candidate_tie_switches,
++                "current_total_load_kW": cur_total,
++                "affected_node_details": [
++                    {"node": nid, "load_kw": node_map.get(nid, {}).get("load_kw", 0),
++                     "voltage_pu": node_map.get(nid, {}).get("voltage_pu", 0),
++                     "pv_kw": node_map.get(nid, {}).get("pv_kw", 0), "ev_kw": node_map.get(nid, {}).get("ev_kw", 0),
++                     "risk_level": node_map.get(nid, {}).get("risk_level", "low")}
++                    for nid in outage_nums
++                ],
++                "power_flow_summary": ext.get("power_flow_summary") or {},
++                "diagnostics": {**algo_result.to_dict(), "algorithm_source": "external"},
++                "warnings": warnings + ([algo_result.warning] if algo_result.warning else []),
++            }
++        # 返回无有效数据 → 走 fallback
++
++    # 外部已配置但不可用
++    if not algo_result.available and algo_result.error != "not_configured":
++        return {
++            "success": False, "has_data": True,
++            "algorithm_source": "external_unavailable",
++            "message": "外部故障分析算法服务暂不可用，结果需人工复核",
++            "fault_line": fault_key,
++            "outage_nodes": [], "candidate_tie_switches": [],
++            "diagnostics": algo_result.to_dict(),
++            "warnings": warnings + ["外部故障分析算法服务暂不可用，结果需人工复核"],
++        }
++
++    # ---- 本地 BFS 拓扑兜底 ----
++    warnings.append("外部故障分析算法服务暂不可用，已使用本地拓扑算法兜底，结果需人工复核")
++    return _run_local_fault_bfs(data, nodes, lines_data, fault_key, src_tag, trusted, warnings, parse_errors)
++
++
++@app.post("/api/boundary/analyze-realtime")
++def boundary_analyze_realtime(req: BoundaryAnalyzeRealtimeRequest):
++    """边界判定统一接口：外部算法优先，不可用时本地拓扑兜底。
++    注意：/api/fault/analyze-realtime 结果中已含 boundary_nodes，前端可直接复用而不必单独调用本接口。
++    """
++    data = realtime_module._latest_data
++    if data is None or not data.get("nodes"):
++        return {"success": False, "has_data": False,
++                "message": "暂无实时数据，请先接入Simulink数据",
++                "warnings": ["暂无实时数据，请先接入Simulink数据"]}
++
++    nodes = data.get("nodes", [])
++    lines_data = data.get("lines", [])
++    fault_str = req.fault_line.strip()
++    if parse_line_pair(fault_str) is None:
++        return {"success": False, "message": f"故障线路格式非法: {fault_str}，需为数字-数字"}
++    fault_key = normalize_line_key(fault_str)
++    outage_nums = list(req.outage_nodes or [])
++    trusted = realtime_module._latest_trusted or False
++
++    warnings = []
++    if not trusted:
++        warnings.append("当前数据源未验证，结果需人工复核")
++
++    # ---- IEEE33 算法服务桥接：边界判定 ----
++    from app.services.ieee33_algorithm_client import boundaryAnalyze as algo_boundary
++    algo_result = algo_boundary({
++        "request_id": f"bnd_{datetime.now().strftime('%Y%m%d%H%M%S')}",
++        "fault_line": fault_key,
++        "timestamp": realtime_module._last_update or "",
++    })
++    if algo_result.available and algo_result.ok:
++        ext = algo_result.data
++        bnd = ext.get("boundary") or {}
++        energized = (bnd.get("energized_boundary_nodes") or bnd.get("energized_boundary_buses") or [])
++        outage_b = (bnd.get("outage_boundary_nodes") or bnd.get("dead_boundary_buses") or
++                     bnd.get("outage_boundary_buses") or [])
++        b_nodes = ext.get("boundary_nodes") or bnd.get("boundary_nodes") or []
++        # 若外部未返回 boundary_nodes 但有 energized/outage 分侧，则自动构造
++        if not b_nodes and (energized or outage_b):
++            b_nodes = []
++            for eb in (energized if isinstance(energized, list) else []):
++                b_nodes.append({"energized_bus": eb, "side": "energized"})
++            for ob in (outage_b if isinstance(outage_b, list) else []):
++                existing = [n for n in b_nodes if n.get("outage_bus") == ob]
++                if existing:
++                    existing[0]["outage_bus"] = ob
++                else:
++                    b_nodes.append({"outage_bus": ob, "side": "outage"})
++        crossing = ext.get("crossing_ties") or bnd.get("crossing_ties") or []
++        if isinstance(b_nodes, list) and b_nodes:
++            return {
++                "success": True, "has_data": True,
++                "algorithm_source": "external",
++                "fault_line": fault_key,
++                "boundary": bnd,
++                "energized_boundary_nodes": energized,
++                "outage_boundary_nodes": outage_b,
++                "boundary_nodes": b_nodes,
++                "crossing_ties": crossing,
++                "diagnostics": {**algo_result.to_dict(), "algorithm_source": "external"},
++                "warnings": warnings + ([algo_result.warning] if algo_result.warning else []),
++            }
++
++    if not algo_result.available and algo_result.error != "not_configured":
++        return {
++            "success": False, "has_data": True,
++            "algorithm_source": "external_unavailable",
++            "message": "外部边界判定算法服务暂不可用，结果需人工复核",
++            "fault_line": fault_key,
++            "boundary_nodes": [], "crossing_ties": [],
++            "diagnostics": algo_result.to_dict(),
++            "warnings": warnings + ["外部边界判定算法服务暂不可用，结果需人工复核"],
++        }
++
++    # ---- 本地拓扑兜底 ----
++    warnings.append("外部边界判定算法服务暂不可用，已使用本地拓扑算法兜底，结果需人工复核")
++
++    # ---- 本地拓扑兜底：重跑 BFS 取 boundary ----
++    b_nodes, b_lines, crossing = [], [], []
++    try:
++        adj = {}; all_pairs = set()
++        for l in lines_data:
++            ln = l.get("line", ""); st = l.get("status", 1)
++            pair = parse_line_pair(ln)
++            if pair is None: continue
++            key = f"{pair[0]}-{pair[1]}"
++            all_pairs.add(pair)
++            if key == fault_key: continue
++            if st == 1:
++                aid, bid = f"BUS-{pair[0]:02d}", f"BUS-{pair[1]:02d}"
++                adj.setdefault(aid, []).append(bid); adj.setdefault(bid, []).append(aid)
++            elif st == 0:
++                crossing.append({"line": key, "from": pair[0], "to": pair[1], "status": 0, "type": "potential_crossing_tie"})
++        visited = set(); q = ["BUS-01"]
++        while q:
++            u = q.pop(0)
++            if u in visited: continue
++            visited.add(u)
++            for v in adj.get(u, []):
++                if v not in visited: q.append(v)
++        reachable = {int(x.replace("BUS-", "")) for x in visited}
++        for (a, b) in all_pairs:
++            if (a in reachable) != (b in reachable):
++                b_nodes.append({"energized_bus": a if a in reachable else b,
++                                "outage_bus": b if a in reachable else a,
++                                "tie_line": f"{a}-{b}"})
++                b_lines.append({"line": f"{a}-{b}",
++                                "source_side": a if a in reachable else b,
++                                "outage_side": b if a in reachable else a})
++    except Exception:
++        pass
+ 
+     return {
+-        "success": True,
+-        "has_data": True,
+-        "source": "realtime",
+-        "source_tag": src_tag,
+-        "trusted_source": trusted,
+-        "timestamp": data.get("timestamp", ""),
+-        "message": "基于实时拓扑完成故障分析",
++        "success": True, "has_data": True,
++        "algorithm_source": "local_fallback",
++        "fault_line": fault_key,
++        "boundary_nodes": b_nodes, "boundary_lines": b_lines,
++        "crossing_ties": crossing,
++        "message": "本地拓扑边界兜底（仅为拓扑计算，外部边界判定算法未配置；结果需人工复核）",
++        "diagnostics": {"algorithm_source": "local_fallback"},
++        "warnings": warnings,
++    }
++
++
++@app.post("/api/transfer/recommend-realtime")
++def transfer_recommend_realtime(req: TransferRecommendRealtimeRequest):
++    """转供决策统一接口：外部算法优先，不可用时返回本地拓扑候选（非评分推荐）"""
++    data = realtime_module._latest_data
++    if data is None or not data.get("nodes"):
++        return {"success": False, "has_data": False,
++                "message": "暂无实时数据，请先接入Simulink数据",
++                "warnings": ["暂无实时数据，请先接入Simulink数据"]}
++
++    nodes = data.get("nodes", [])
++    lines_data = data.get("lines", [])
++    fault_str = req.fault_line.strip()
++    if parse_line_pair(fault_str) is None:
++        return {"success": False, "message": f"故障线路格式非法: {fault_str}，需为数字-数字"}
++    fault_key = normalize_line_key(fault_str)
++    outage_nums = list(req.outage_nodes or [])
++    boundary_nums = list(req.boundary_nodes or [])
++    trusted = realtime_module._latest_trusted or False
++
++    warnings = []
++    if not trusted:
++        warnings.append("当前数据源未验证，结果需人工复核")
++
++    # ---- IEEE33 算法服务桥接：pipeline/evaluate（异步任务）----
++    from app.services.ieee33_algorithm_client import submitPipelineEvaluate as algo_pipeline
++    ti = compute_time_index(realtime_module._last_update or "")
++    pipeline_payload = {
++        "request_id": f"tr_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+         "fault_line": fault_key,
+-        "source_node": 1,
+-        "reachable_nodes": reachable_nums,
+         "outage_nodes": outage_nums,
+-        "boundary_nodes": boundary_nodes,
+-        "boundary_edges": boundary_edges,
+-        "candidate_tie_switches": candidate_tie_switches,
+-        "current_total_load_kW": current_total_load_kw,
+-        "affected_load_kW": affected_load_kw,
+-        "affected_count": len(outage_nums),
+-        "reachable_count": len(reachable_nums),
+-        "powered_nodes": reachable_nums,
+-        "affected_node_details": details,
+-        "power_flow_summary": power_flow_summary,
++        "timestamp": realtime_module._last_update or "",
++        "time_index": ti,
++        "evaluation_mode": "auto",
++        "allow_nearest_library_time": True,
++        "max_ties": 2,
++        "snapshot": {
++            "timestamp": realtime_module._last_update or "",
++            "time_index": ti,
++            "nodes": nodes, "lines": lines_data,
++            "switches": data.get("switches", {}),
++        },
++    }
++    algo_result = algo_pipeline(pipeline_payload)
++    if algo_result.available and algo_result.ok:
++        ext = algo_result.data
++        # 标准化候选方案
++        cands = (ext.get("candidate_tie_switches") or ext.get("candidate_plans") or
++                 ext.get("candidates") or [])
++        cand_plans = ext.get("candidate_plans") or cands
++        # 推荐方案：有完整对象直接用；只有 plan_id 则从 candidate_plans 中查找
++        rec = ext.get("recommended_plan") or None
++        rec_id = ext.get("recommended_plan_id") or (rec.get("plan_id") if isinstance(rec, dict) else None)
++        if not isinstance(rec, dict) and rec_id and isinstance(cand_plans, list):
++            for cp in cand_plans:
++                if str(cp.get("plan_id") or cp.get("id") or "") == str(rec_id):
++                    rec = cp
++                    break
++        # switching_plan 补全：如果候选方案有 tie_lines 但没有 switching_plan，临时生成
++        for cp in (cand_plans if isinstance(cand_plans, list) else []):
++            if not cp.get("switching_plan") and cp.get("tie_lines"):
++                cp["switching_plan"] = {
++                    "open_lines": [fault_key],
++                    "close_lines": cp["tie_lines"],
++                }
++                warnings.append("算法服务未显式返回 switching_plan，业务后端根据 fault_line 和 tie_lines 生成临时 switching_plan，需复核")
++        if isinstance(cands, list) and cands:
++            return {
++                "success": True, "has_data": True,
++                "algorithm_source": "external",
++                "fault_analysis": ext.get("fault_analysis") or {},
++                "boundary": ext.get("boundary") or {},
++                "candidate_tie_switches": cands,
++                "candidate_plans": cand_plans,
++                "recommended_plan": rec,
++                "recommended_plan_id": rec_id,
++                "fault_line": fault_key,
++                "outage_nodes": outage_nums,
++                "diagnostics": {**algo_result.to_dict(), "algorithm_source": "external"},
++                "warnings": warnings + ([algo_result.warning] if algo_result.warning else []),
++            }
++
++    if not algo_result.available and algo_result.error != "not_configured":
++        from app.services.ieee33_algorithm_client import ALGO_JOB_TIMEOUT_MS as _jt_ms
++        job_id = algo_result.data.get("job_id") or ""
++        if algo_result.error in ("job_timeout", "job_status_fetch_failed") and job_id:
++            # pipeline 已提交但轮询超时 → pending，保留 job_id 供后续查询
++            return {
++                "success": True, "has_data": True,
++                "algorithm_source": "external_pending",
++                "status": "pending",
++                "job_id": job_id,
++                "fault_line": fault_key, "outage_nodes": outage_nums,
++                "candidate_tie_switches": [], "candidate_plans": [],
++                "recommended_plan": None, "recommended_plan_id": None,
++                "switching_plan": None,
++                "diagnostics": {**algo_result.to_dict(), "algorithm_source": "external_pending"},
++                "warnings": warnings + [
++                    "转供决策任务仍在计算中，请稍后继续查询",
++                    f"可调用 GET /api/transfer/jobs/{job_id} 查询任务状态",
++                    f"可调用 GET /api/transfer/jobs/{job_id}/result 获取结果",
++                    "结果需人工复核",
++                ],
++            }
++        src = "external_unavailable"
++        msg = "外部转供决策算法服务暂不可用，结果需人工复核"
++        w = warnings + ["外部转供决策算法服务暂不可用，未生成可信推荐方案"]
++        if job_id:
++            w.append(f"已提交任务 job_id={job_id}，但轮询中断，可联系张同学确认任务状态")
++        return {
++            "success": False, "has_data": True,
++            "algorithm_source": src,
++            "message": msg,
++            "job_id": job_id,
++            "fault_line": fault_key,
++            "candidate_tie_switches": [], "recommended_plan": None,
++            "diagnostics": {**algo_result.to_dict(), "algorithm_source": src},
++            "warnings": w,
++        }
++
++    # ---- 本地拓扑候选兜底（仅标注 topology_candidate，不是推荐方案）----
++    topology_cands = []
++    try:
++        adj = {}; all_pairs = set()
++        for l in lines_data:
++            ln = l.get("line", ""); st = l.get("status", 1)
++            pair = parse_line_pair(ln)
++            if pair is None: continue
++            key = f"{pair[0]}-{pair[1]}"
++            all_pairs.add(pair)
++            if key == fault_key: continue
++            if st == 1:
++                aid, bid = f"BUS-{pair[0]:02d}", f"BUS-{pair[1]:02d}"
++                adj.setdefault(aid, []).append(bid); adj.setdefault(bid, []).append(aid)
++        visited = set(); q = ["BUS-01"]
++        while q:
++            u = q.pop(0)
++            if u in visited: continue
++            visited.add(u)
++            for v in adj.get(u, []):
++                if v not in visited: q.append(v)
++        reachable = {int(x.replace("BUS-", "")) for x in visited}
++        outage_set = set(outage_nums)
++        for l in lines_data:
++            ln = l.get("line", "")
++            pair = parse_line_pair(ln)
++            if pair is None: continue
++            key = f"{pair[0]}-{pair[1]}"
++            if key == fault_key: continue
++            if l.get("status", 1) == 0:
++                a_live = pair[0] in reachable
++                b_live = pair[1] in reachable
++                if a_live != b_live:
++                    topology_cands.append({
++                        "line": key,
++                        "from": pair[0], "to": pair[1],
++                        "status": 0,
++                        "type": "topology_candidate",
++                        "caveat": "仅为拓扑候选，不是评分推荐方案；请使用 evaluate-realtime 获取完整评分",
++                    })
++    except Exception:
++        pass
++
++    return {
++        "success": True, "has_data": True,
++        "algorithm_source": "local_fallback",
++        "fault_line": fault_key, "outage_nodes": outage_nums, "boundary_nodes": boundary_nums,
++        "candidate_tie_switches": topology_cands,
++        "recommended_plan": None,
++        "switching_plan": None,
++        "message": "本地拓扑候选兜底（仅为拓扑候选，外部转供决策算法未配置；请使用 evaluate-realtime 获取完整评分推荐）",
++        "diagnostics": {"algorithm_source": "local_fallback", "candidate_type": "topology_only"},
+         "warnings": warnings,
+     }
+ 
+ 
++# ==================== 算法任务状态查询（包装外部 /api/v1/jobs，不暴露 Key）====================
++
++@app.get("/api/transfer/jobs/{job_id}")
++def transfer_job_status(job_id: str):
++    """查询转供决策异步任务状态（包装 GET /api/v1/jobs/{job_id}）"""
++    from app.services.ieee33_algorithm_client import getJob
++    r = getJob(job_id)
++    if r.ok:
++        return {
++            "success": True,
++            "algorithm_source": "external",
++            "job_id": job_id,
++            "status": r.data.get("status") or r.data.get("state") or "unknown",
++            "data": r.data,
++            "warnings": [r.warning] if r.warning else [],
++        }
++    return {
++        "success": False,
++        "algorithm_source": "external_unavailable",
++        "job_id": job_id,
++        "status": "unknown",
++        "diagnostics": r.to_dict(),
++        "warnings": ["无法查询算法任务状态，服务不可用或未配置", "结果需人工复核"],
++    }
++
++
++@app.get("/api/transfer/jobs/{job_id}/result")
++def transfer_job_result(job_id: str):
++    """查询转供决策异步任务结果（包装 GET /api/v1/jobs/{job_id}/result）"""
++    from app.services.ieee33_algorithm_client import getJob, getJobResult
++    # 先查状态
++    status_r = getJob(job_id)
++    if status_r.ok:
++        state = (status_r.data.get("status") or status_r.data.get("state") or "").lower()
++        if state not in ("completed", "done", "success"):
++            return {
++                "success": True,
++                "algorithm_source": "external",
++                "job_id": job_id,
++                "status": "pending",
++                "job_state": state,
++                "candidate_tie_switches": [], "candidate_plans": [],
++                "recommended_plan": None, "recommended_plan_id": None,
++                "switching_plan": None,
++                "warnings": ["转供决策任务仍在计算中，请稍后继续查询"],
++            }
++    result_r = getJobResult(job_id)
++    if result_r.ok:
++        ext = result_r.data
++        return {
++            "success": True,
++            "algorithm_source": "external",
++            "job_id": job_id,
++            "status": "completed",
++            "candidate_tie_switches": ext.get("candidate_tie_switches") or ext.get("candidates") or [],
++            "candidate_plans": ext.get("candidate_plans") or [],
++            "recommended_plan": ext.get("recommended_plan"), "recommended_plan_id": ext.get("recommended_plan_id"),
++            "switching_plan": ext.get("switching_plan"),
++            "warnings": (ext.get("warnings") or []) + ([result_r.warning] if result_r.warning else []),
++        }
++    return {
++        "success": False,
++        "algorithm_source": "external_unavailable",
++        "job_id": job_id,
++        "status": "unknown",
++        "diagnostics": result_r.to_dict(),
++        "warnings": ["无法获取算法任务结果，服务不可用或任务未完成", "结果需人工复核"],
++    }
++
++
+ @app.post("/api/transfer/evaluate-realtime")
+ def transfer_evaluate_realtime(req: TransferEvaluateRealtimeRequest):
+     """基于实时故障分析结果，评估并排序转供方案"""
+@@ -758,6 +1221,75 @@ def transfer_evaluate_realtime(req: TransferEvaluateRealtimeRequest):
+             for j in range(i + 1, len(candidates)):
+                 plans.append(evaluate_plan([candidates[i], candidates[j]]))
+ 
++    # ---- 外部算法桥接：优先调用 candidates/generate → 过滤 → 评分 ----
++    from app.services.ieee33_algorithm_client import candidatesGenerate as algo_candidates
++    algo_transfer_result = algo_candidates({
++        "request_id": f"ev_{datetime.now().strftime('%Y%m%d%H%M%S')}",
++        "fault_line": fault_key,
++        "timestamp": realtime_module._last_update or "",
++    })
++    ext_candidates_source = "local_rule"
++    if algo_transfer_result.available and algo_transfer_result.ok:
++        algo_data = algo_transfer_result.data
++        raw_cands = algo_data.get("candidates") or algo_data.get("candidate_plans") or []
++        if isinstance(raw_cands, list) and raw_cands:
++            feasible = []; rejected = []
++            for rc in raw_cands:
++                if not isinstance(rc, dict): continue
++                pid = str(rc.get("plan_id") or rc.get("algorithm_plan_id") or "").strip()
++                tids = rc.get("tie_ids") or rc.get("tie_branch_indices") or []
++                tlines = rc.get("tie_lines") or []
++                restored = rc.get("restored_buses") or rc.get("restored_nodes") or []
++                topo_ok = rc.get("topology_feasible")
++                radial_ok = rc.get("radial")
++                cycle = rc.get("cycle_count")
++                is_ok = (topo_ok is True and radial_ok is True and cycle == 0)
++                item = {
++                    "plan_id": pid,
++                    "tie_ids": tids if isinstance(tids, list) else [tids],
++                    "tie_lines": tlines if isinstance(tlines, list) else [tlines],
++                    "restored_nodes": restored if isinstance(restored, list) else [restored],
++                    "topology_feasible": topo_ok, "radial": radial_ok, "cycle_count": cycle,
++                    "is_feasible": is_ok,
++                    "source": "external_candidates",
++                    "score_source": "external_candidates",
++                }
++                if is_ok:
++                    feasible.append(item)
++                else:
++                    item["reject_reason"] = "形成环网，不满足辐射状运行约束" if not radial_ok and cycle > 0 else "拓扑不可行"
++                    rejected.append(item)
++            if feasible:
++                ext_candidates_source = "external_candidates"
++                # 将可行外部候选方案归一化为 candidate_scores 写入缓存，供下方合并逻辑处理
++                norm_scores = []
++                for item in feasible:
++                    norm_scores.append({
++                        "plan_id": item["plan_id"],
++                        "tie_lines": item["tie_lines"],
++                        "tie_ids": item["tie_ids"],
++                        "score_source": "external_candidates",
++                        "is_feasible": True,
++                    })
++                global _external_score_result
++                _external_score_result = {
++                    "fault_line": fault_key,
++                    "timestamp": algo_data.get("timestamp") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
++                    "algorithm": algo_data.get("algorithm") or "external_algo",
++                    "algorithm_version": algo_data.get("algorithm_version") or "",
++                    "candidate_scores": norm_scores,
++                    "feasible_candidates": feasible,
++                    "rejected_candidates": rejected,
++                    "received_at": datetime.now(),
++                }
++            # 外部候选结果写入 warnings
++            if not feasible:
++                warnings.append("外部候选方案接口返回了候选方案，但均不满足拓扑可行性条件")
++        else:
++            warnings.append("外部候选方案接口返回为空，使用本地规则版预评估")
++    else:
++        warnings.append("外部候选方案接口暂不可用，当前使用规则版预评估")
++
+     # ---- 合并外部高级评分（MATPOWER 等）----
+     # 条件：缓存存在 + fault_line 归一化一致 + 未过期（5分钟）；按 plan_id 或 tie_lines 集合匹配
+     ext = _external_score_result
+@@ -867,13 +1399,17 @@ def transfer_evaluate_realtime(req: TransferEvaluateRealtimeRequest):
+         "total_plans": len(plans),
+         "static_tie_fallback_used": static_tie_fallback_used,
+         "recommended_plan": recommended,
+-        "plans": returned_plans,  # 最多 10 个 + 必含推荐方案
++        "plans": returned_plans,
++        "external_feasible_candidates": (_external_score_result or {}).get("feasible_candidates") if ext_candidates_source == "external_candidates" else None,
++        "external_rejected_candidates": (_external_score_result or {}).get("rejected_candidates") if ext_candidates_source == "external_candidates" else None,
+         "diagnostics": {
+             "external_score_available": ext_available,
+             "external_score_used_count": ext_used_count,
+             "external_score_algorithm": ext_algo,
+             "external_score_timestamp": ext_ts,
+             "score_mode": "external_matpower" if ext_used_count > 0 else "local_rule",
++            "candidates_source": ext_candidates_source,
++            **algo_transfer_result.to_dict(),
+         },
+         "warnings": warnings,
+     }
+@@ -915,6 +1451,114 @@ def dashboard_summary():
+     }
+ 
+ 
++# ==================== 安全校验统一接口（外部算法适配层）====================
++
++@app.post("/api/safety/validate-realtime")
++def safety_validate_realtime(req: SafetyValidateRealtimeRequest):
++    """安全校验/潮流校验统一接口：外部算法优先，不可用时严格拒绝生成正式操作票"""
++    data = realtime_module._latest_data
++    if data is None or not data.get("nodes"):
++        return {
++            "success": False, "has_data": False,
++            "message": "暂无实时数据，请先接入Simulink数据",
++            "warnings": ["暂无实时数据，请先接入Simulink数据"],
++        }
++
++    nodes = data.get("nodes", [])
++    lines_data = data.get("lines", [])
++    fault_str = req.fault_line.strip()
++    if parse_line_pair(fault_str) is None:
++        return {"success": False, "message": f"故障线路格式非法: {fault_str}，需为数字-数字"}
++    fault_key = normalize_line_key(fault_str)
++    tie_switch = normalize_line_key(req.candidate_tie_switch) if req.candidate_tie_switch else ""
++    switching_plan = list(req.switching_plan or [])
++    trusted = realtime_module._latest_trusted or False
++
++    warnings = []
++    if not trusted:
++        warnings.append("当前数据源未验证，结果需人工复核")
++
++    # ---- 构造 switching_plan：支持完整对象 / candidate_tie_switch 自动生成 ----
++    switching_plan = (req.switching_plan or {})
++    if isinstance(switching_plan, list):
++        switching_plan = {"open_lines": [], "close_lines": []}
++    if not isinstance(switching_plan, dict) or (not switching_plan.get("open_lines") and not switching_plan.get("close_lines")):
++        tie_str = str(req.candidate_tie_switch or "").strip()
++        if tie_str and parse_line_pair(tie_str):
++            switching_plan = {
++                "open_lines": [fault_key],
++                "close_lines": [normalize_line_key(tie_str)],
++            }
++        elif not switching_plan:
++            return {"success": False, "has_data": True,
++                    "message": "缺少 switching_plan 或 candidate_tie_switch，请传入转供操作方案",
++                    "warnings": warnings}
++
++    limits = {"min_voltage_pu": 0.95, "max_voltage_pu": 1.05, "max_loading_pct": 100.0}
++    if isinstance(req.switching_plan, dict) and req.switching_plan.get("limits"):
++        limits.update(req.switching_plan["limits"])
++
++    # ---- IEEE33 算法服务桥接：安全/潮流校验 ----
++    from app.services.ieee33_algorithm_client import safetyValidate as algo_safety
++    ti = compute_time_index(realtime_module._last_update or "")
++    algo_result = algo_safety({
++        "request_id": f"safety_{datetime.now().strftime('%Y%m%d%H%M%S')}",
++        "timestamp": realtime_module._last_update or "",
++        "time_index": ti,
++        "snapshot": {
++            "timestamp": realtime_module._last_update or "",
++            "time_index": ti,
++            "nodes": nodes, "lines": lines_data, "switches": data.get("switches", {}),
++        },
++        "switching_plan": switching_plan,
++        "limits": limits,
++    })
++    if algo_result.available and algo_result.ok:
++        ext = algo_result.data
++        conv = ext.get("converged")
++        safe = ext.get("safe")
++        violations = ext.get("violations") or []
++        # 安全只有全部条件满足才能出正式票
++        can_ticket = bool(trusted and conv is True and safe is True and len(violations) == 0)
++        return {
++            "success": True, "has_data": True,
++            "algorithm_source": "external",
++            "converged": conv,
++            "safe": safe,
++            "topology": ext.get("topology") or {},
++            "power_flow": ext.get("power_flow") or {},
++            "nodes": ext.get("nodes") or [],
++            "lines": ext.get("lines") or [],
++            "violations": violations,
++            "electrical_credibility": {
++                "level": "high" if can_ticket else "low",
++                "powerflow_validated": conv is True,
++                "can_generate_formal_ticket": can_ticket,
++            },
++            "diagnostics": {**algo_result.to_dict(), "algorithm_source": "external"},
++            "warnings": warnings + (ext.get("warnings") or []) + ([algo_result.warning] if algo_result.warning else []),
++        }
++
++    # ---- 外部不可用 / 未配置 → 严格拒绝（不返回 502）----
++    return {
++        "success": False, "has_data": True,
++        "algorithm_source": "unavailable",
++        "converged": None, "safe": None,
++        "message": "外部潮流安全校验服务暂不可用，不能生成正式操作票",
++        "electrical_credibility": {
++            "level": "low",
++            "powerflow_validated": False,
++            "can_generate_formal_ticket": False,
++        },
++        "diagnostics": algo_result.to_dict() if algo_result else {},
++        "warnings": warnings + [
++            "安全/潮流校验接口尚未接入",
++            "未完成重构后潮流计算，结果不可用于正式操作票",
++            "结果需人工复核",
++        ],
++    }
++
++
+ # ==================== 外部高级评分接入（MATPOWER 适配层）====================
+ 
+ class ExternalScoreUpdateRequest(BaseModel):
+@@ -1090,6 +1734,13 @@ def on_startup():
+         print("后端将以只读模式运行，请确保 MySQL 已启动并执行 CREATE DATABASE power_ticket_system")
+ 
+ 
++@app.get("/api/algorithm/health")
++def algorithm_health():
++    """算法服务健康检查：代理后端调用 GET /api/v1/health + /api/v1/capabilities"""
++    from app.services.ieee33_algorithm_client import checkAlgorithmHealth
++    return checkAlgorithmHealth()
++
++
+ @app.get("/")
+ def root():
+     return {"message": "国网江苏市级配电网智能成票与安全校验系统 API", "version": "2.0", "docs": "/docs"}
+diff --git a/backend/safety/scenario.xlsx b/backend/safety/scenario.xlsx
+index e417959..50c8c25 100644
+Binary files a/backend/safety/scenario.xlsx and b/backend/safety/scenario.xlsx differ
+diff --git a/backend/safety_runtime/report.xlsx b/backend/safety_runtime/report.xlsx
+index 2f3078a..efceff5 100644
+Binary files a/backend/safety_runtime/report.xlsx and b/backend/safety_runtime/report.xlsx differ
+diff --git a/backend/safety_runtime/scenario.xlsx b/backend/safety_runtime/scenario.xlsx
+index e417959..50c8c25 100644
+Binary files a/backend/safety_runtime/scenario.xlsx and b/backend/safety_runtime/scenario.xlsx differ
+diff --git a/frontend/src/pages/BoundaryJudgment.tsx b/frontend/src/pages/BoundaryJudgment.tsx
+index 7cef9e8..1ed1f66 100644
+--- a/frontend/src/pages/BoundaryJudgment.tsx
++++ b/frontend/src/pages/BoundaryJudgment.tsx
+@@ -3,120 +3,180 @@ import { useSearchParams } from 'react-router-dom';
+ import PageContainer from '../layouts/PageContainer';
+ import SectionCard from '../components/SectionCard';
+ import WorkflowProgress from '../components/WorkflowProgress';
+-import { saveWorkflowState, getWorkflowState } from '../store/workflowStore';
+-import type { BoundaryResult } from '../types';
++import { saveWorkflowState } from '../store/workflowStore';
++
++function normLineKey(ln: string): string {
++  const s = String(ln).replace(/^Bus\s*/i, '').replace(/\s*区段\s*$/, '').trim();
++  const p = s.split('-');
++  if (p.length === 2) { const a = parseInt(p[0]), b = parseInt(p[1]); if (!isNaN(a) && !isNaN(b)) return a < b ? `${a}-${b}` : `${b}-${a}`; }
++  return s;
++}
++
++function safeText(v: unknown, fallback = '-'): string {
++  if (v === undefined || v === null || v === '') return fallback;
++  return String(v);
++}
++
++function hasVal(v: unknown): boolean { return v !== undefined && v !== null && v !== ''; }
++
++interface BoundaryRealtimeResult {
++  success: boolean; has_data?: boolean; algorithm_source?: string;
++  fault_line?: string; boundary_nodes?: any[]; boundary_lines?: any[];
++  energized_boundary_nodes?: (number | string)[];
++  outage_boundary_nodes?: (number | string)[];
++  crossing_ties?: any[]; affected_load_kW?: number;
++  trusted_source?: boolean; warnings?: string[]; message?: string;
++}
+ 
+ export default function BoundaryJudgment() {
+   const [searchParams] = useSearchParams();
+-  const [result, setResult] = useState<BoundaryResult | null>(null);
++  const savedFault = localStorage.getItem('current_fault_line') || '';
++  const [faultLine, setFaultLine] = useState(normLineKey(savedFault || searchParams.get('fault_line') || '8-9'));
++  const [result, setResult] = useState<BoundaryRealtimeResult | null>(null);
+   const [loading, setLoading] = useState(false);
+   const [error, setError] = useState('');
+-  const [scenarioInput, setScenarioInput] = useState('馈线故障');
+-  const [faultDevice, setFaultDevice] = useState('');
+-  const [faultSection, setFaultSection] = useState('');
+-  const [faultFeeder, setFaultFeeder] = useState('');
+ 
+   useEffect(() => {
+-    const device = searchParams.get('faultDevice');
+-    const section = searchParams.get('faultSection');
+-    const feeder = searchParams.get('faultFeeder');
+-    if (device) {
+-      setFaultDevice(device);
+-      setFaultSection(section || '');
+-      setFaultFeeder(feeder || '10kV城中馈线');
+-    } else {
+-      const state = getWorkflowState();
+-      if (state.faultInput?.faultDevice) {
+-        setFaultDevice(state.faultInput.faultDevice);
+-        setFaultSection(state.faultInput.faultSection || '');
+-        setFaultFeeder(state.faultInput.faultFeeder || '10kV城中馈线');
+-      }
+-      if (state.boundaryResult) setResult(state.boundaryResult);
+-    }
++    const fl = searchParams.get('fault_line');
++    if (fl) setFaultLine(normLineKey(fl));
+   }, [searchParams]);
+ 
+   const handleJudge = async () => {
+-    setLoading(true); setError('');
++    setLoading(true); setError(''); setResult(null);
++    const fl = normLineKey(faultLine);
+     try {
+-      const res = await fetch('http://localhost:8000/api/boundary/judge', {
++      const res = await fetch('http://localhost:8000/api/boundary/analyze-realtime', {
+         method: 'POST', headers: { 'Content-Type': 'application/json' },
+-        body: JSON.stringify({ scenario: scenarioInput, faultDevice: faultDevice || undefined, faultSection: faultSection || undefined, faultFeeder: faultFeeder || undefined }),
++        body: JSON.stringify({ fault_line: fl }),
+       });
+       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+-      const json = await res.json();
+-      if (json.data) {
+-        setResult(json.data);
+-        saveWorkflowState({ scenarioId: json.data.scenarioId, faultInput: { faultDevice, faultSection, faultFeeder, scenarioType: scenarioInput }, boundaryResult: json.data });
++      const json: BoundaryRealtimeResult = await res.json();
++      if (!json.success) { setError(json.message || '边界判定失败'); return; }
++      setResult(json);
++      localStorage.setItem('current_fault_line', json.fault_line || fl);
++      // 只保存边界结果，确保后续未执行步骤不被误标记为完成
++      saveWorkflowState({ boundaryResult: json, transferPlan: undefined, operationSequence: undefined, ticket: undefined, safetyCheckResult: undefined });
++    } catch (e: any) {
++      if (e.message?.includes('404')) {
++        setError('边界判定接口未匹配，请检查前端调用路径是否为 /api/boundary/analyze-realtime');
++      } else {
++        setError(e.message || '请求失败，请确认后端服务已启动');
+       }
+-    } catch (e: any) { setError(e.message || '请求失败，请确认后端服务已启动'); }
+-    finally { setLoading(false); }
++    } finally { setLoading(false); }
+   };
+ 
++  const energized = (result?.energized_boundary_nodes || []) as (number | string)[];
++  const outageBuses = (result?.outage_boundary_nodes || []) as (number | string)[];
++  const crossing = (result?.crossing_ties || []) as any[];
++
+   return (
+     <PageContainer title="边界判定">
+       <WorkflowProgress currentStep="boundary" />
+ 
+       <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+-        {/* 左侧：输入表单 */}
+-        <div style={{ flex: '0 0 360px' }}>
++        {/* 左侧：35% */}
++        <div style={{ flex: '0 0 35%', minWidth: 280 }}>
+           <SectionCard title="故障输入">
+             <p style={{ fontSize: 12, color: '#667085', marginBottom: 14 }}>
+-              输入或从拓扑图选择故障点，系统将根据拓扑连接关系、开关状态和保护动作信息生成隔离边界。
++              输入故障线路（格式如 8-9、13-14），系统调用边界判定算法生成隔离边界。
+             </p>
+             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+-              <FormField label="故障场景">
+-                <select value={scenarioInput} onChange={(e) => setScenarioInput(e.target.value)}
+-                  style={inputStyle}>
+-                  <option value="馈线故障">馈线故障</option>
+-                  <option value="主变故障">主变故障</option>
+-                  <option value="母线故障">母线故障</option>
+-                </select>
+-              </FormField>
+-              {faultDevice && (
+-                <>
+-                  <FormField label="故障设备"><input value={faultDevice} readOnly style={{ ...inputStyle, background: '#f3f6f9' }} /></FormField>
+-                  <FormField label="故障区段"><input value={faultSection} readOnly style={{ ...inputStyle, background: '#f3f6f9' }} /></FormField>
+-                  <FormField label="故障馈线"><input value={faultFeeder} readOnly style={{ ...inputStyle, background: '#f3f6f9' }} /></FormField>
+-                </>
+-              )}
+-              <button onClick={handleJudge} disabled={loading}
+-                className="btn-primary" style={{ width: '100%' }}>
++              <div>
++                <label style={{ display: 'block', fontSize: 12, color: '#667085', marginBottom: 4 }}>故障线路</label>
++                <input value={faultLine} onChange={e => setFaultLine(e.target.value)}
++                  style={{ width: '100%', padding: '8px 10px', border: '1px solid #c8d6e5', borderRadius: 6, fontSize: 13, background: '#fff', color: '#1f2937' }} />
++              </div>
++              <button onClick={handleJudge} disabled={loading} className="btn-primary" style={{ width: '100%' }}>
+                 {loading ? '判定中...' : '开始边界判定'}
+               </button>
+-              {error && <div style={{ color: '#eb5757', fontSize: 12 }}>❌ {error}</div>}
++              {error && <div style={{ color: '#eb5757', fontSize: 12, marginTop: 4 }}>❌ {error}</div>}
+             </div>
+           </SectionCard>
+         </div>
+ 
+-        {/* 右侧：判定结果 */}
+-        <div style={{ flex: 1, minWidth: 400 }}>
++        {/* 右侧：65% */}
++        <div style={{ flex: 1, minWidth: 480 }}>
+           {result ? (
+-            <SectionCard title="判定结果">
+-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px 20px' }}>
+-                <ResultItem label="故障区段" value={result.faultSection} color="#eb5757" />
+-                <ResultItem label="跳闸断路器" value={result.tripBreaker} color="#2f80ed" />
+-                <ResultItem label="隔离开关" value={result.isolationSwitches.join('、')} />
+-                <ResultItem label="后备设备" value={result.backupTripDevices.join('、')} />
+-                <ResultItem label="失电负荷" value={`${result.lostLoad} MW`} color="#eb5757" />
+-                <ResultItem label="反送电风险" value={result.reversePowerRisk ? '⚠ 存在' : '无'} color={result.reversePowerRisk ? '#eb5757' : '#1f8a4c'} />
+-                <ResultItem label="边界结论" value="建议隔离后转供" color="#1f8a4c" />
+-                <ResultItem label="场景编号" value={result.scenarioId} />
+-              </div>
+-              <div style={{ marginTop: 16, borderTop: '1px solid #e2e8f0', paddingTop: 12 }}>
+-                <div style={{ fontSize: 12, color: '#667085', marginBottom: 8 }}>校验项：</div>
+-                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+-                  {result.checkItems.map((item: string, i: number) => (
+-                    <span key={i} style={{ padding: '4px 10px', borderRadius: 4, fontSize: 12, background: '#e8f5e9', color: '#1f8a4c', border: '1px solid #a5d6a7' }}>
+-                      ✅ {item}
+-                    </span>
+-                  ))}
++            <>
++              {/* trusted_source warning */}
++              {result.trusted_source === false && (
++                <div style={{ background: '#fff8e1', border: '1px solid #f2c94c', borderRadius: 6, padding: '8px 14px', marginBottom: 12, fontSize: 12, color: '#b8860b' }}>
++                  ⚠️ 当前数据源未验证，结果需人工复核
+                 </div>
+-              </div>
+-            </SectionCard>
++              )}
++              {result.warnings && result.warnings.length > 0 && (
++                <div style={{ background: '#fff8e1', border: '1px solid #f2c94c', borderRadius: 6, padding: '8px 14px', marginBottom: 12, fontSize: 12, color: '#b8860b' }}>
++                  ⚠️ {result.warnings.join('；')}
++                </div>
++              )}
++
++              {/* 判定结果摘要 */}
++              <SectionCard title="判定结果">
++                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px 20px', fontSize: 13 }}>
++                  <ResultItem label="算法来源" value={result.algorithm_source === 'external' ? '外部算法' : result.algorithm_source === 'local_fallback' ? '本地兜底' : safeText(result.algorithm_source)} color={result.algorithm_source === 'external' ? '#1f8a4c' : '#b8860b'} />
++                  <ResultItem label="故障线路" value={safeText(result.fault_line)} color="#eb5757" />
++                  <ResultItem label="带电侧边界节点" value={safeText(energized.length)} />
++                  <ResultItem label="停电侧边界节点" value={safeText(outageBuses.length)} />
++                  <ResultItem label="联络线/穿越线" value={safeText(crossing.length)} />
++                  {hasVal(result.affected_load_kW) && <ResultItem label="影响负荷" value={`${result.affected_load_kW} kW`} color="#eb5757" />}
++                </div>
++              </SectionCard>
++
++              {/* 边界节点明细：带电侧 + 停电侧 */}
++              {(energized.length > 0 || outageBuses.length > 0) && (
++                <SectionCard title="边界节点明细" style={{ marginTop: 12 }}>
++                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
++                    <thead><tr style={{ background: '#f3f6f9' }}>
++                      <th style={th}>类型</th><th style={th}>节点</th><th style={th}>关联线路</th><th style={th}>说明</th>
++                    </tr></thead>
++                    <tbody>
++                      {energized.map((bus, i) => (
++                        <tr key={`e-${i}`} style={{ borderBottom: '1px solid #f0f0f0' }}>
++                          <td style={td}><span style={{ background: '#e8f5e9', color: '#1f8a4c', padding: '2px 8px', borderRadius: 3, fontSize: 11 }}>带电侧边界</span></td>
++                          <td style={{ ...td, fontWeight: 600 }}>Bus {safeText(bus)}</td>
++                          <td style={{ ...td, color: '#94a3b8' }}>{crossing.filter(ct => ct.energized_side_bus === bus || ct.outage_side_bus === bus).map(ct => safeText(ct.line)).filter(Boolean).join(', ') || '-'}</td>
++                          <td style={td}>带电区域边界节点</td>
++                        </tr>
++                      ))}
++                      {outageBuses.map((bus, i) => (
++                        <tr key={`o-${i}`} style={{ borderBottom: '1px solid #f0f0f0' }}>
++                          <td style={td}><span style={{ background: '#ffebee', color: '#eb5757', padding: '2px 8px', borderRadius: 3, fontSize: 11 }}>停电侧边界</span></td>
++                          <td style={{ ...td, fontWeight: 600 }}>Bus {safeText(bus)}</td>
++                          <td style={{ ...td, color: '#94a3b8' }}>{crossing.filter(ct => ct.energized_side_bus === bus || ct.outage_side_bus === bus).map(ct => safeText(ct.line)).filter(Boolean).join(', ') || '-'}</td>
++                          <td style={td}>停电区域边界节点</td>
++                        </tr>
++                      ))}
++                    </tbody>
++                  </table>
++                </SectionCard>
++              )}
++
++              {/* 联络线/穿越线明细 */}
++              {crossing.length > 0 && (
++                <SectionCard title="联络线/穿越线明细" style={{ marginTop: 12 }}>
++                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
++                    <thead><tr style={{ background: '#f3f6f9' }}>
++                      <th style={th}>联络线</th><th style={th}>编号</th><th style={th}>带电侧</th><th style={th}>停电侧</th><th style={th}>分支索引</th>
++                    </tr></thead>
++                    <tbody>
++                      {crossing.map((ct, i) => (
++                        <tr key={i} style={{ borderBottom: '1px solid #f0f0f0' }}>
++                          <td style={{ ...td, fontWeight: 600 }}>{safeText(ct.line)}</td>
++                          <td style={td}>{safeText(ct.tie_id)}</td>
++                          <td style={{ ...td, color: '#1f8a4c' }}>Bus {safeText(ct.energized_side_bus)}</td>
++                          <td style={{ ...td, color: '#eb5757' }}>Bus {safeText(ct.outage_side_bus)}</td>
++                          <td style={td}>{safeText(ct.branch_index)}</td>
++                        </tr>
++                      ))}
++                    </tbody>
++                  </table>
++                </SectionCard>
++              )}
++            </>
+           ) : (
+             <SectionCard title="判定结果">
+               <div style={{ textAlign: 'center', padding: 60, color: '#94a3b8', fontSize: 13 }}>
+-                在左侧输入故障信息后点击「开始边界判定」，结果将在此显示
++                在左侧输入故障线路后点击「开始边界判定」，结果将在此显示
+               </div>
+             </SectionCard>
+           )}
+@@ -126,15 +186,6 @@ export default function BoundaryJudgment() {
+   );
+ }
+ 
+-function FormField({ label, children }: { label: string; children: React.ReactNode }) {
+-  return (
+-    <div>
+-      <label style={{ display: 'block', fontSize: 12, color: '#667085', marginBottom: 4 }}>{label}</label>
+-      {children}
+-    </div>
+-  );
+-}
+-
+ function ResultItem({ label, value, color }: { label: string; value: string; color?: string }) {
+   return (
+     <div style={{ padding: '8px 0', borderBottom: '1px solid #f3f6f9', fontSize: 13 }}>
+@@ -144,7 +195,5 @@ function ResultItem({ label, value, color }: { label: string; value: string; col
+   );
+ }
+ 
+-const inputStyle: React.CSSProperties = {
+-  width: '100%', padding: '8px 10px', border: '1px solid #c8d6e5', borderRadius: 6,
+-  fontSize: 13, background: '#fff', color: '#1f2937',
+-};
++const th: React.CSSProperties = { textAlign: 'left', padding: '8px 10px', fontWeight: 600, color: '#667085', borderBottom: '2px solid #c8d6e5' };
++const td: React.CSSProperties = { padding: '6px 10px', color: '#1f2937' };
+diff --git a/frontend/src/pages/Forecast.tsx b/frontend/src/pages/Forecast.tsx
+index e34bbf5..36dd2f5 100644
+--- a/frontend/src/pages/Forecast.tsx
++++ b/frontend/src/pages/Forecast.tsx
+@@ -8,7 +8,9 @@ function fmt(v: unknown, d = 1): string { const n = Number(v); return Number.isF
+ interface ForecastStep { step: number; time_offset_min: number; forecast_hour?: number; total_load_kw: number; total_pv_kw: number; total_ev_kw: number; total_net_load_kw: number; }
+ interface NodeSeries { step: number; time_offset_min: number; forecast_hour?: number; forecast_load_kw: number; forecast_pv_kw: number; forecast_ev_kw: number; forecast_net_load_kw: number; }
+ interface NodeForecast { node: number; current_load_kw: number; current_pv_kw: number; current_ev_kw: number; current_net_load_kw: number; voltage_pu: number; risk_level: string; series: NodeSeries[]; }
+-interface ForecastResult { success: boolean; has_data?: boolean; message?: string; base_time?: string; base_hour?: number; forecast_mode?: string; time_source?: string; timestamp?: string; horizon?: number; interval_minutes?: number; current_total_load_kw: number; current_total_pv_kw: number; current_total_ev_kw: number; current_total_net_load_kw: number; forecast_series: ForecastStep[]; node_forecasts: NodeForecast[]; warnings: string[]; }
++interface RiskNode { node: number; risk_level: string; voltage_pu?: number; current_net_load_kw?: number; peak_net_load_kw?: number; risk_reason?: string[]; reasons?: string[]; }
++
++interface ForecastResult { success: boolean; has_data?: boolean; message?: string; base_time?: string; base_hour?: number; forecast_mode?: string; time_source?: string; timestamp?: string; horizon?: number; interval_minutes?: number; algorithm_source?: string; current_total_load_kw: number; current_total_pv_kw: number; current_total_ev_kw: number; current_total_net_load_kw: number; forecast_series: ForecastStep[]; node_forecasts: NodeForecast[]; risk_nodes?: RiskNode[]; warnings: string[]; }
+ 
+ function getRisk(nf: NodeForecast): { reasons: string[]; maxLevel: string; maxNet: number; peakHour: number; growth: number } {
+   const reasons: string[] = [];
+@@ -28,6 +30,23 @@ function getRisk(nf: NodeForecast): { reasons: string[]; maxLevel: string; maxNe
+   return { reasons: reasons.length > 0 ? reasons : ['正常'], maxLevel, maxNet, peakHour, growth };
+ }
+ 
++/** 将 API 返回的 risk_nodes 按风险级别筛选（high/medium）或全部 */
++function riskNodeToRow(rn: RiskNode) {
++  const reasons = rn.risk_reason || rn.reasons || [];
++  return {
++    node: rn.node,
++    voltage_pu: rn.voltage_pu ?? 0,
++    curNet: rn.current_net_load_kw ?? 0,
++    maxNet: rn.peak_net_load_kw ?? 0,
++    peakHour: 0,
++    growth: 0,
++    maxLevel: rn.risk_level || 'low',
++    risk_level: rn.risk_level || 'low',
++    reasons: reasons.length > 0 ? reasons : ['正常'],
++    isRisk: rn.risk_level === 'high' || rn.risk_level === 'medium',
++  };
++}
++
+ const HORIZON_OPTIONS = [{ v:1, label:'未来1h' },{ v:6, label:'未来6h' },{ v:12, label:'未来12h' },{ v:24, label:'未来24h' }];
+ 
+ export default function Forecast() {
+@@ -56,8 +75,12 @@ export default function Forecast() {
+     finally { setLoading(false); }
+   };
+ 
++  const apiRiskNodes: RiskNode[] = result?.risk_nodes ?? [];
+   const nodes: NodeForecast[] = result?.node_forecasts ?? [];
+-  const riskRows = nodes.map(nf => { const r = getRisk(nf); return { ...r, node: nf.node, voltage_pu: nf.voltage_pu, curNet: nf.current_net_load_kw, risk_level: nf.risk_level, isRisk: r.maxLevel !== 'low' || r.reasons[0] !== '正常' }; }).filter(r => r.isRisk);
++  // 优先使用 API 返回的 risk_nodes；若为空则从 node_forecasts 按本地规则筛选
++  const riskRows = apiRiskNodes.length > 0
++    ? apiRiskNodes.map(riskNodeToRow).filter(r => r.isRisk)
++    : nodes.map(nf => { const r = getRisk(nf); return { ...r, node: nf.node, voltage_pu: nf.voltage_pu, curNet: nf.current_net_load_kw, risk_level: nf.risk_level, isRisk: r.maxLevel !== 'low' || r.reasons[0] !== '正常' }; }).filter(r => r.isRisk);
+   const filtered = filterLevel === '全部' ? riskRows : riskRows.filter(r => r.risk_level === filterLevel);
+   const highCount = riskRows.filter(r => r.risk_level === 'high').length;
+   const midCount = riskRows.filter(r => r.risk_level === 'medium').length;
+@@ -66,9 +89,6 @@ export default function Forecast() {
+ 
+   // 数据时间：优先 API 返回的 timestamp (realtime 原始时间)
+   const dataTime = result?.timestamp || result?.base_time || '--';
+-  const diag = (result as any)?.diagnostics;
+-  const pvZero = diag && !diag.field_check?.has_pv_kw;
+-  const evZero = diag && !diag.field_check?.has_ev_kw;
+ 
+   return (
+     <PageContainer title="源荷预测风险">
+@@ -120,9 +140,9 @@ export default function Forecast() {
+         </div>
+       )}
+ 
+-      {(pvZero || evZero) && result && (
+-        <div style={{ marginBottom:10, padding:'6px 10px', background:'#e3f0ff', borderRadius:4, border:'1px solid #90caf9', fontSize:11, color:'#2f80ed' }}>
+-          💡 Simulink 实时数据中 {[pvZero&&'光伏出力',evZero&&'EV负荷'].filter(Boolean).join('和')} 为 0，预测中 PV/EV 将均为 0，待张同学 Simulink 模型加入光伏/电动车数据后将自动更新。
++      {result && result.algorithm_source === 'local_fallback' && (
++        <div style={{ marginBottom:10, padding:'6px 10px', background:'#fff8e1', borderRadius:4, border:'1px solid #f2c94c', fontSize:11, color:'#b8860b' }}>
++          ⚠️ 当前使用本地规则版预测（confidence=low），外部预测算法服务暂不可用，结果需人工复核。
+         </div>
+       )}
+ 
+@@ -201,7 +221,9 @@ export default function Forecast() {
+             </table>
+           </div>
+         ) : !loading ? (
+-          <div style={{ textAlign:'center', padding:40, color:'#94a3b8', fontSize:13 }}>点击"刷新{hLabel}预测"后，风险节点将在此显示</div>
++          <div style={{ textAlign:'center', padding:40, color:'#94a3b8', fontSize:13 }}>
++            {result ? '当前预测时段未发现高/中风险节点。' : `点击"刷新${hLabel}预测"后，风险节点将在此显示`}
++          </div>
+         ) : (
+           <div style={{ textAlign:'center', padding:40, color:'#94a3b8', fontSize:13 }}>加载中...</div>
+         )}
+@@ -236,7 +258,7 @@ export default function Forecast() {
+       )}
+ 
+       <div style={{ marginTop:12, padding:'8px 14px', background:'#e3f0ff', borderRadius:4, border:'1px solid #90caf9', fontSize:11, color:'#1f2937' }}>
+-        💡 预测时域最长支持24小时。风险节点基于 <code>/api/forecast/realtime</code> 返回的实时源荷预测结果生成，综合考虑节点电压、风险等级、所选预测时域内净负荷峰值增长率和EV负荷高峰。
++        💡 风险节点列表基于 <code>/api/forecast/realtime</code> 返回的实时预测结果；业务后端优先调用 IEEE33 算法服务，服务不可用时使用本地规则版兜底并提示人工复核。
+       </div>
+     </PageContainer>
+   );
+diff --git a/frontend/src/pages/TransferDecision.tsx b/frontend/src/pages/TransferDecision.tsx
+index e167252..bd93db8 100644
+--- a/frontend/src/pages/TransferDecision.tsx
++++ b/frontend/src/pages/TransferDecision.tsx
+@@ -4,21 +4,26 @@ import SectionCard from '../components/SectionCard';
+ import WorkflowProgress from '../components/WorkflowProgress';
+ import { saveWorkflowState } from '../store/workflowStore';
+ 
+-// ---- 类型 ----
++// ---- types ----
+ interface RealtimeLine { line: string; current_a: number; power_kw: number; status: number; }
+ interface RealtimeLatest { success: boolean; has_data?: boolean; lines?: RealtimeLine[]; }
+ interface ScoreBreakdown { recovery_score?:number; recovery_max?:number; loading_score?:number; loading_max?:number; loading_score_source?:string; voltage_score?:number; voltage_max?:number; operation_score?:number; operation_max?:number; full_restore_bonus?:number; full_restore_bonus_max?:number; total_score?:number; total_max?:number; loss_score?:number; risk_score?:number; total?:number; }
+ interface PowerFlow { converged?: boolean; min_voltage_pu?: number; max_voltage_pu?: number; max_loading_pct?: number; loss_kw?: number; }
+ interface TieLoadingDetail { line: string; estimated_transfer_kw: number | null; limit_kw: number | null; loading_rate: number | null; }
+ interface TransferPlanItem { rank: number; tie_name: string; tie_switch: string; tie_lines?: string[]; score: number; score_breakdown?: ScoreBreakdown; restored_nodes: number[]; restored_count: number; restored_load_kw: number; restoration_rate_pct: number; min_restored_voltage_pu: number | null; voltage_ok?: boolean | null; radial_ok?: boolean; overloaded?: boolean; is_usable?: boolean; tie_loading_pct: number | null; tie_loading_detail?: TieLoadingDetail[]; tie_current_a: number | null; tie_power_kw: number | null; switch_operations: number; still_outage_nodes: number[]; still_outage_count: number; warnings?: string[]; score_source?: string; external_score_used?: boolean; external_rank?: number | null; power_flow?: PowerFlow | null; violations?: any[]; }
+-interface EvalDiagnostics { external_score_available?: boolean; external_score_used_count?: number; external_score_algorithm?: string | null; external_score_timestamp?: string | null; score_mode?: string; }
++interface EvalDiagnostics { external_score_available?: boolean; external_score_used_count?: number; external_score_algorithm?: string | null; external_score_timestamp?: string | null; score_mode?: string; candidates_source?: string; }
++interface ExternalCandidate { plan_id: string; tie_ids: string[]; tie_lines: string[]; restored_nodes?: number[]; topology_feasible?: boolean; radial?: boolean; cycle_count?: number; is_feasible?: boolean; source?: string; score_source?: string; reject_reason?: string; }
+ interface EvalResult {
+   success: boolean; has_data?: boolean; fault_line: string; outage_nodes: number[]; outage_count: number; outage_load_kw: number; total_load_kw: number;
+   boundary_nodes?: string[]; boundary_edges?: {line:string;source_side:number;outage_side:number}[];
+   total_plans: number; candidate_count?: number;
+-  recommended_plan: TransferPlanItem | null; plans: TransferPlanItem[]; warnings: string[]; message?: string;
++  recommended_plan: TransferPlanItem | null; plans: TransferPlanItem[];
++  candidate_plans?: TransferPlanItem[]; external_feasible_candidates?: ExternalCandidate[]; external_rejected_candidates?: ExternalCandidate[];
++  warnings: string[]; message?: string;
+   diagnostics?: EvalDiagnostics;
++  algorithm_source?: string; status?: string; job_id?: string; candidates_source?: string;
+ }
++interface PendingJobResult { success: boolean; algorithm_source?: string; job_id?: string; status?: string; job_state?: string; candidate_tie_switches?: any[]; candidate_plans?: TransferPlanItem[]; recommended_plan?: TransferPlanItem | null; recommended_plan_id?: string | null; switching_plan?: any; warnings?: string[]; }
+ 
+ const TIE_LINES = new Set(['21-8','8-21','9-15','15-9','12-22','22-12','18-33','33-18','25-29','29-25']);
+ const TIE_NAMES: Record<string,string> = {'21-8':'T1','8-21':'T1','9-15':'T2','15-9':'T2','12-22':'T3','22-12':'T3','18-33':'T4','33-18':'T4','25-29':'T5','29-25':'T5'};
+@@ -36,21 +41,21 @@ function fmtUnit(v: number, unit: string): string {
+ function normLineKey(ln: string): string { const p = ln.split('-'); if (p.length !== 2) return ln; const a = parseInt(p[0]), b = parseInt(p[1]); return isNaN(a) || isNaN(b) ? ln : a < b ? `${a}-${b}` : `${b}-${a}`; }
+ 
+ export default function TransferDecision() {
+-  // 从 localStorage 读取边界判定结果（归一化，与 option value / 后端键一致）
+   const savedFault = normLineKey(localStorage.getItem('current_fault_line') || '8-9');
+   const [faultLine, setFaultLine] = useState(savedFault);
+   const [faultSource, setFaultSource] = useState(savedFault !== '8-9' || localStorage.getItem('current_fault_line') ? '边界判定结果' : '默认值');
+   const [manualInput, setManualInput] = useState(false);
+   const [showOpenLines, setShowOpenLines] = useState(false);
+-
+   const [realtimeLines, setRealtimeLines] = useState<RealtimeLine[]>([]);
+   const [result, setResult] = useState<EvalResult | null>(null);
+   const [loading, setLoading] = useState(false);
+   const [error, setError] = useState('');
+   const [selectedPlan, setSelectedPlan] = useState<TransferPlanItem | null>(null);
+   const [confirmed, setConfirmed] = useState(false);
++  const [pendingJobId, setPendingJobId] = useState('');
++  const [queryingJob, setQueryingJob] = useState(false);
++  const [pendingResult, setPendingResult] = useState<TransferPlanItem[] | null>(null);
+ 
+-  // 加载实时线路列表
+   useEffect(() => {
+     fetch('http://localhost:8000/api/realtime/latest')
+       .then(r => r.json())
+@@ -58,70 +63,112 @@ export default function TransferDecision() {
+       .catch(() => {});
+   }, []);
+ 
+-  // 可选线路
+   const availableLines = useMemo(() => {
+     return realtimeLines
+       .filter(l => showOpenLines || l.status === 1)
+-      .map(l => ({
+-        ...l,
+-        normKey: normLineKey(l.line),
+-        isTie: TIE_LINES.has(l.line),
+-        tieName: TIE_NAMES[l.line] || '',
+-        label: `${l.line}｜${TIE_LINES.has(l.line) ? '联络线' : '主干线'}｜${l.status === 1 ? '闭合' : '断开'}｜I=${l.current_a?.toFixed(1) || 0}A｜P=${l.power_kw?.toFixed(1) || 0}kW`,
+-      }))
++      .map(l => ({ ...l, normKey: normLineKey(l.line), isTie: TIE_LINES.has(l.line), tieName: TIE_NAMES[l.line] || '', label: `${l.line}｜${TIE_LINES.has(l.line) ? '联络线' : '主干线'}｜${l.status === 1 ? '闭合' : '断开'}｜I=${l.current_a?.toFixed(1) || 0}A｜P=${l.power_kw?.toFixed(1) || 0}kW` }))
+       .sort((a, b) => (a.isTie ? 1 : 0) - (b.isTie ? 1 : 0));
+   }, [realtimeLines, showOpenLines]);
+ 
+-  // 校验线路是否存在
+   const lineExists = useMemo(() => {
+-    if (!realtimeLines.length) return true; // 还没加载，先放行
++    if (!realtimeLines.length) return true;
+     const nk = normLineKey(faultLine);
+     return realtimeLines.some(l => normLineKey(l.line) === nk);
+   }, [faultLine, realtimeLines]);
+ 
++  // ===== actions =====
++
+   const handleDecide = async () => {
+-    // 校验
+-    if (realtimeLines.length > 0 && !lineExists) {
+-      setError('线路不存在，请从实时线路列表中选择');
+-      return;
+-    }
+-    const posted = normLineKey(faultLine); // 以当前下拉框/输入框选中值为准
+-    setLoading(true); setError(''); setResult(null);
++    if (realtimeLines.length > 0 && !lineExists) { setError('线路不存在，请从实时线路列表中选择'); return; }
++    const posted = normLineKey(faultLine);
++    setLoading(true); setError(''); setResult(null); setPendingJobId(''); setPendingResult(null);
+     try {
+-      const res = await fetch('http://localhost:8000/api/transfer/evaluate-realtime', {
+-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+-        body: JSON.stringify({ fault_line: posted }),
+-      });
+-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+-      const json: EvalResult = await res.json();
+-      if (!json.success) { setError(json.message || '转供评估失败'); return; }
+-      // 接口返回与当前选择不一致 → console.warn 并以接口返回为准
+-      if (json.fault_line && json.fault_line !== posted) {
+-        console.warn(`[transfer] 接口返回 fault_line=${json.fault_line} 与当前选择 ${posted} 不一致，以接口返回为准`);
++      // 并行调用：recommend-realtime 拿 pending/score，evaluate-realtime 拿 candidates/summary
++      const [recResp, evalResp] = await Promise.all([
++        fetch('http://localhost:8000/api/transfer/recommend-realtime', {
++          method: 'POST', headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify({ fault_line: posted, evaluation_mode: 'auto', max_ties: 2 }),
++        }),
++        fetch('http://localhost:8000/api/transfer/evaluate-realtime', {
++          method: 'POST', headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify({ fault_line: posted }),
++        }),
++      ]);
++      const recJson = await recResp.json();
++      const evalJson = evalResp.ok ? await evalResp.json() : null;
++
++      // 合并：用 evaluate-realtime 的 candidates + fault_summary，用 recommend-realtime 的 pending/score
++      const merged: any = {
++        ...(evalJson || {}),
++        ...recJson,
++        // 如果有 evaluate 的 external_candidates，保留（recommend 的 pending 响应中没有这些）
++        external_feasible_candidates: (evalJson as any)?.external_feasible_candidates ?? (recJson as any)?.external_feasible_candidates ?? [],
++        external_rejected_candidates: (evalJson as any)?.external_rejected_candidates ?? (recJson as any)?.external_rejected_candidates ?? [],
++        candidate_plans: (evalJson as any)?.candidate_plans ?? (recJson as any)?.candidate_plans ?? [],
++        plans: (evalJson as any)?.plans ?? (recJson as any)?.plans ?? [],
++        // 优先用 evaluate 的 summary 字段
++        fault_line: (recJson as any).fault_line || (evalJson as any)?.fault_line || posted,
++        outage_nodes: (evalJson as any)?.outage_nodes ?? (recJson as any)?.outage_nodes ?? [],
++        outage_count: (evalJson as any)?.outage_count ?? (recJson as any)?.outage_count ?? 0,
++        outage_load_kw: (evalJson as any)?.outage_load_kw ?? (recJson as any)?.outage_load_kw ?? 0,
++        total_load_kw: (evalJson as any)?.total_load_kw ?? (recJson as any)?.total_load_kw ?? 0,
++        total_plans: Math.max((evalJson as any)?.total_plans ?? 0, (recJson as any)?.total_plans ?? 0),
++      };
++
++      if (!merged.success && !(merged as any).algorithm_source && !(merged as any).job_id) { setError((merged as any).message || '转供评估失败'); return; }
++      if (merged.fault_line && merged.fault_line !== posted) {
++        console.warn(`[transfer] fault_line mismatch: returned=${merged.fault_line} selected=${posted}`);
+       }
+-      if (json.fault_line) setFaultLine(json.fault_line);
+-      setResult(json);
+-      setSelectedPlan(json.recommended_plan);
++      if (merged.fault_line) setFaultLine(merged.fault_line);
++      if ((merged as any).algorithm_source === 'external_pending' || (merged as any).status === 'pending') {
++        setPendingJobId((merged as any).job_id || '');
++      }
++      // 外部候选数修正 (evaluate 会带 candidates_source=external_candidates)
++      if ((evalJson as any)?.diagnostics?.candidates_source === 'external_candidates') {
++        merged.diagnostics = { ...(merged.diagnostics || {}), candidates_source: 'external_candidates' };
++      }
++      setResult(merged as EvalResult);
++      setSelectedPlan((merged as any).recommended_plan || null);
+       setConfirmed(false);
+-      // 成功返回后才写入 localStorage（避免旧值覆盖当前选择）
+-      localStorage.setItem('current_fault_line', json.fault_line || posted);
+-      localStorage.setItem('current_transfer_result', JSON.stringify(json));
++      setPendingResult(null);
++      localStorage.setItem('current_fault_line', merged.fault_line || posted);
++      localStorage.setItem('current_transfer_result', JSON.stringify(merged));
+     } catch (e: any) { setError('转供评估失败：' + (e.message || '请确认后端已启动')); }
+     finally { setLoading(false); }
+   };
+ 
+-  /** 统一处理故障线路变更：切换线路立即清除旧分析结果，保证顶栏/摘要/候选方案一致 */
++  const handleQueryJob = async (jobId: string) => {
++    setQueryingJob(true);
++    try {
++      const res = await fetch(`http://localhost:8000/api/transfer/jobs/${jobId}/result`);
++      if (!res.ok) throw new Error(`HTTP ${res.status}`);
++      const json: PendingJobResult = await res.json();
++      if (json.status === 'pending' || json.job_state === 'pending' || json.job_state === 'running') {
++        setPendingResult(null);
++      } else if (json.status === 'completed' && json.candidate_plans?.length) {
++        const plans: TransferPlanItem[] = (json.candidate_plans || []).map((p: any, i: number) => ({ ...p, rank: p.rank || i + 1 }));
++        setPendingResult(plans);
++        if (json.recommended_plan) setSelectedPlan(json.recommended_plan);
++      }
++    } catch (e: any) { console.warn('查询任务结果失败:', e.message); }
++    finally { setQueryingJob(false); }
++  };
++
+   const changeFaultLine = (v: string, source: string) => {
+     setFaultLine(v);
+     setFaultSource(source);
+-    if (result && result.fault_line !== normLineKey(v)) {
+-      setResult(null);
+-      setSelectedPlan(null);
+-      setConfirmed(false);
+-    }
++    setResult(null); setSelectedPlan(null); setConfirmed(false);
++    setPendingJobId(''); setPendingResult(null); setError('');
+   };
+ 
+-  const plans: TransferPlanItem[] = result?.plans ?? [];
++  // ===== derived state =====
++
++  const isPending = (result as any)?.algorithm_source === 'external_pending' || (result as any)?.status === 'pending';
++  const jobId = (result as any)?.job_id || pendingJobId;
++  const extFeasible: ExternalCandidate[] = (result as any)?.external_feasible_candidates ?? [];
++  const extRejected: ExternalCandidate[] = (result as any)?.external_rejected_candidates ?? [];
++  const hasExternalCands = extFeasible.length > 0 || extRejected.length > 0;
++  const plans: TransferPlanItem[] = pendingResult ?? (hasExternalCands ? [] : result?.plans ?? []);
+   const recommended = result?.recommended_plan;
+   const boundaryEdges = result?.boundary_edges ?? [];
+   const allTieCandidates = ['21-8','9-15','12-22','18-33','25-29'];
+@@ -130,106 +177,136 @@ export default function TransferDecision() {
+     <PageContainer title="转供决策">
+       <WorkflowProgress currentStep="transfer" />
+ 
+-      {/* warnings */}
+       {result?.warnings && result.warnings.length > 0 && result.warnings[0] !== '暂无实时数据，请先接入Simulink数据' && (
+-        <div style={{ background: '#fff8e1', border: '1px solid #f2c94c', borderRadius: 6, padding: '8px 14px', marginBottom: 12, fontSize: 12, color: '#b8860b' }}>
+-          ⚠️ {result.warnings.join('；')}
+-        </div>
++        <div style={{ background:'#fff8e1', border:'1px solid #f2c94c', borderRadius:6, padding:'8px 14px', marginBottom:12, fontSize:12, color:'#b8860b' }}>⚠️ {result.warnings.join('；')}</div>
+       )}
+ 
+-      {/* 评分模式提示 */}
+-      {result?.diagnostics && (
++      {/* score mode info */}
++      {isPending && jobId ? (
++        <div style={{ background:'#e3f0ff', border:'1px solid #90caf9', borderRadius:6, padding:'6px 14px', marginBottom:12, fontSize:12, color:'#2f80ed' }}>
++          🔬 外部候选方案已生成，外部 MATPOWER 评分任务正在计算中；下方规则版评分仅作临时参考。
++        </div>
++      ) : result?.diagnostics && (
+         result.diagnostics.score_mode === 'external_matpower' ? (
+-          <div style={{ background: '#e3f0ff', border: '1px solid #90caf9', borderRadius: 6, padding: '6px 14px', marginBottom: 12, fontSize: 12, color: '#2f80ed' }}>
+-            🔬 评分模式：MATPOWER 外部评分（算法 {result.diagnostics.external_score_algorithm || '-'}，数据时间 {result.diagnostics.external_score_timestamp || '-'}，匹配 {result.diagnostics.external_score_used_count} 个方案）
++          <div style={{ background:'#e3f0ff', border:'1px solid #90caf9', borderRadius:6, padding:'6px 14px', marginBottom:12, fontSize:12, color:'#2f80ed' }}>
++            🔬 评分模式：MATPOWER 外部评分
++          </div>
++        ) : result.diagnostics.candidates_source === 'external_candidates' ? (
++          <div style={{ background:'#e3f0ff', border:'1px solid #90caf9', borderRadius:6, padding:'6px 14px', marginBottom:12, fontSize:12, color:'#2f80ed' }}>
++            🔬 外部候选方案已生成（{extFeasible.length}可行 + {extRejected.length}不可行），待 MATPOWER 评分
+           </div>
+         ) : result.diagnostics.external_score_available ? (
+-          <div style={{ background: '#fff8e1', border: '1px solid #f2c94c', borderRadius: 6, padding: '6px 14px', marginBottom: 12, fontSize: 12, color: '#b8860b' }}>
++          <div style={{ background:'#fff8e1', border:'1px solid #f2c94c', borderRadius:6, padding:'6px 14px', marginBottom:12, fontSize:12, color:'#b8860b' }}>
+             ⚠️ 外部评分结果未匹配当前故障或已过期，当前使用规则版评分
+           </div>
+         ) : (
+-          <div style={{ background: '#f3f6f9', border: '1px solid #c8d6e5', borderRadius: 6, padding: '6px 14px', marginBottom: 12, fontSize: 12, color: '#667085' }}>
++          <div style={{ background:'#f3f6f9', border:'1px solid #c8d6e5', borderRadius:6, padding:'6px 14px', marginBottom:12, fontSize:12, color:'#667085' }}>
+             当前使用规则版评分（尚未接入外部 MATPOWER 评分结果）
+           </div>
+         )
+       )}
+ 
+-      {/* 故障线路来源 */}
+-      <div style={{ marginBottom: 12, fontSize: 12, color: '#667085', background: '#f3f6f9', padding: '6px 12px', borderRadius: 4, display: 'flex', alignItems: 'center', gap: 8 }}>
+-        <span>当前故障线路：<strong style={{ color: '#eb5757' }}>{faultLine}</strong></span>
+-        <span>|</span>
+-        <span>来源：{faultSource}</span>
+-        {faultSource === '默认值' && <span style={{ fontSize: 10, color: '#94a3b8' }}>（可在边界判定页面设置后自动继承）</span>}
++      {/* pending (non-error) */}
++      {isPending && jobId && (
++        <div style={{ background:'#e3f0ff', border:'1px solid #90caf9', borderRadius:6, padding:'10px 14px', marginBottom:12, fontSize:12, color:'#2f80ed' }}>
++          <div style={{ marginBottom:6 }}>
++            ⏳ 外部转供决策任务正在计算中<br/>
++            任务编号：<code style={{ background:'#fff', padding:'1px 6px', borderRadius:3 }}>{jobId}</code>
++          </div>
++          <button onClick={() => handleQueryJob(jobId)} disabled={queryingJob}
++            style={{ padding:'5px 14px', borderRadius:4, fontSize:11, cursor:'pointer', background:'#2f80ed', color:'#fff', border:'none' }}>
++            {queryingJob ? '查询中...' : '查询任务结果'}
++          </button>
++          {queryingJob && <span style={{ marginLeft:10, fontSize:11, color:'#667085' }}>正在查询算法任务状态...</span>}
++          {!queryingJob && pendingResult === null && <span style={{ marginLeft:10, fontSize:11, color:'#667085' }}>任务仍在计算中</span>}
++          {pendingResult !== null && pendingResult.length > 0 && <span style={{ marginLeft:10, fontSize:11, color:'#1f8a4c' }}>✅ 任务完成，已加载 {pendingResult.length} 个方案</span>}
++        </div>
++      )}
++
++      {/* fault line info */}
++      <div style={{ marginBottom:12, fontSize:12, color:'#667085', background:'#f3f6f9', padding:'6px 12px', borderRadius:4, display:'flex', alignItems:'center', gap:8 }}>
++        <span>当前故障线路：<strong style={{ color:'#eb5757' }}>{faultLine}</strong></span>
++        <span>|</span> <span>来源：{faultSource}</span>
++        {faultSource === '默认值' && <span style={{ fontSize:10, color:'#94a3b8' }}>（可在边界判定页面设置后自动继承）</span>}
+       </div>
+ 
+-      {/* 故障线路选择器 */}
+-      <SectionCard title="故障线路选择" style={{ marginBottom: 16 }}>
+-        {/* 实时线路下拉框 */}
+-        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 8 }}>
+-          <span style={{ fontSize: 12, color: '#667085' }}>从实时线路选择：</span>
++      {/* fault line selector */}
++      <SectionCard title="故障线路选择" style={{ marginBottom:16 }}>
++        <div style={{ display:'flex', gap:10, flexWrap:'wrap', alignItems:'center', marginBottom:8 }}>
++          <span style={{ fontSize:12, color:'#667085' }}>从实时线路选择：</span>
+           <select value={faultLine} onChange={e => changeFaultLine(e.target.value, '手动选择')}
+-            style={{ padding: '5px 8px', borderRadius: 4, border: '1px solid #c8d6e5', fontSize: 11, background: '#fff', maxWidth: 400 }}>
+-            {realtimeLines.length === 0 && <option value="8-9">8-9 (默认，等待实时数据)</option>}
+-            {availableLines.map(l => (
+-              /* value 用归一化键，与后端返回/localStorage 保存的 fault_line 保持一致，避免受控 select 失配显示空白 */
+-              <option key={l.line} value={l.normKey}>{l.label}</option>
+-            ))}
++            style={{ padding:'5px 8px', borderRadius:4, border:'1px solid #c8d6e5', fontSize:11, background:'#fff', maxWidth:400 }}>
++            {realtimeLines.length === 0 && <option value="8-9">8-9 (默认)</option>}
++            {availableLines.map(l => <option key={l.line} value={l.normKey}>{l.label}</option>)}
+           </select>
+-          <label style={{ fontSize: 11, color: '#667085', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
+-            <input type="checkbox" checked={showOpenLines} onChange={e => setShowOpenLines(e.target.checked)} />
+-            显示断开/联络线
++          <label style={{ fontSize:11, color:'#667085', cursor:'pointer', display:'flex', alignItems:'center', gap:4 }}>
++            <input type="checkbox" checked={showOpenLines} onChange={e => setShowOpenLines(e.target.checked)} /> 显示断开/联络线
+           </label>
+         </div>
+-        {/* 手动输入 */}
+-        <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+-          <label style={{ fontSize: 11, color: '#667085', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
+-            <input type="checkbox" checked={manualInput} onChange={e => setManualInput(e.target.checked)} />
+-            手动输入线路
++        <div style={{ display:'flex', gap:10, alignItems:'center' }}>
++          <label style={{ fontSize:11, color:'#667085', cursor:'pointer', display:'flex', alignItems:'center', gap:4 }}>
++            <input type="checkbox" checked={manualInput} onChange={e => setManualInput(e.target.checked)} /> 手动输入线路
+           </label>
+-          {manualInput && (
+-            <input value={faultLine} onChange={e => changeFaultLine(e.target.value, '手动输入')}
+-              style={{ padding: '5px 10px', borderRadius: 4, border: '1px solid #c8d6e5', fontSize: 12, width: 100 }} />
+-          )}
+-          {!lineExists && realtimeLines.length > 0 && (
+-            <span style={{ fontSize: 11, color: '#eb5757' }}>⚠ 线路不存在于实时数据中</span>
+-          )}
++          {manualInput && <input value={faultLine} onChange={e => changeFaultLine(e.target.value, '手动输入')} style={{ padding:'5px 10px', borderRadius:4, border:'1px solid #c8d6e5', fontSize:12, width:100 }} />}
++          {!lineExists && realtimeLines.length > 0 && <span style={{ fontSize:11, color:'#eb5757' }}>⚠ 线路不存在于实时数据中</span>}
+         </div>
+-        <div style={{ marginTop: 10 }}>
++        <div style={{ marginTop:10 }}>
+           <button onClick={handleDecide} disabled={loading || (!lineExists && realtimeLines.length > 0)} className="btn-primary">
+             {loading ? '正在计算转供方案...' : '执行转供决策'}
+           </button>
+-          {error && <span style={{ color: '#eb5757', fontSize: 12, marginLeft: 12 }}>❌ {error}</span>}
++          {error && <span style={{ color:'#eb5757', fontSize:12, marginLeft:12 }}>❌ {error}</span>}
+         </div>
+       </SectionCard>
+ 
+-      {/* 故障摘要 */}
+-      {result && (
+-        <SectionCard title="故障分析摘要" style={{ marginBottom: 16 }}>
+-          <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap', fontSize: 13 }}>
+-            <span><span style={{ color: '#667085' }}>故障：</span><strong style={{ color: '#eb5757' }}>{result.fault_line}</strong></span>
+-            <span><span style={{ color: '#667085' }}>停电节点：</span><strong style={{ color: '#eb5757' }}>{result.outage_count} 个</strong></span>
+-            <span><span style={{ color: '#667085' }}>影响负荷：</span><strong style={{ color: '#eb5757' }}>{fmtUnit(result.outage_load_kw, 'kW')}</strong></span>
+-            <span><span style={{ color: '#667085' }}>候选方案：</span><strong style={{ color: '#1f8a4c' }}>{result.total_plans} 个</strong></span>
+-          </div>
+-          {result.outage_nodes.length > 0 && (
+-            <div style={{ marginTop: 6, fontSize: 12, color: '#667085' }}>
+-              停电节点：{result.outage_nodes.join(', ')}
++      {/* external candidates (ALG-*) */}
++      {hasExternalCands && (
++        <SectionCard title={`外部候选方案 (${extFeasible.length}可行 + ${extRejected.length}不可行)`} style={{ marginBottom:16, border:'2px solid #2f80ed' }}>
++          {extFeasible.map(c => (
++            <div key={c.plan_id} style={{ background:'#e8f5e9', border:'1px solid #a5d6a7', borderRadius:6, padding:10, marginBottom:8, fontSize:12 }}>
++              <div style={{ display:'flex', justifyContent:'space-between', marginBottom:4 }}>
++                <strong style={{ color:'#1f8a4c', fontSize:14 }}>{c.plan_id}</strong>
++                <span style={{ fontSize:10, background:'#e3f0ff', color:'#2f80ed', borderRadius:3, padding:'1px 8px' }}>外部候选 · 待评分</span>
++              </div>
++              <div style={{ color:'#667085' }}>
++                联络开关：<strong>{c.tie_ids?.join('、') || '-'}</strong> | 闭合线路：<strong>{c.tie_lines?.join('、') || '-'}</strong>
++              </div>
+             </div>
+-          )}
+-          {boundaryEdges.length > 0 && (
+-            <div style={{ marginTop: 4, fontSize: 12, color: '#667085' }}>
+-              边界边：{boundaryEdges.map(e => `${e.line}(live:${e.source_side}→out:${e.outage_side})`).join(', ')}
++          ))}
++          {extRejected.map(c => (
++            <div key={c.plan_id} style={{ background:'#fff5f5', border:'1px solid #ffcdd2', borderRadius:6, padding:10, marginBottom:8, fontSize:12, opacity:0.8 }}>
++              <div style={{ display:'flex', justifyContent:'space-between', marginBottom:4 }}>
++                <strong style={{ color:'#eb5757', fontSize:14 }}>{c.plan_id}</strong>
++                <span style={{ fontSize:10, background:'#ffebee', color:'#eb5757', borderRadius:3, padding:'1px 8px' }}>不可行</span>
++              </div>
++              <div style={{ color:'#667085' }}>
++                联络开关：<strong>{c.tie_ids?.join('、') || '-'}</strong> | 闭合线路：<strong>{c.tie_lines?.join('、') || '-'}</strong>
++              </div>
++              <div style={{ marginTop:3, fontSize:10, color:'#eb5757' }}>原因：{c.reject_reason || '不满足拓扑约束'}</div>
+             </div>
+-          )}
++          ))}
+         </SectionCard>
+       )}
+ 
+-      <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+-        {/* 左侧：候选方案 */}
+-        <div style={{ flex: 1, minWidth: 400 }}>
++      {/* fault summary */}
++      {result && (
++        <SectionCard title="故障分析摘要" style={{ marginBottom:16 }}>
++          <div style={{ display:'flex', gap:20, flexWrap:'wrap', fontSize:13 }}>
++            <span><span style={{ color:'#667085' }}>故障：</span><strong style={{ color:'#eb5757' }}>{result.fault_line}</strong></span>
++            <span><span style={{ color:'#667085' }}>停电节点：</span><strong style={{ color:'#eb5757' }}>{result.outage_count} 个</strong></span>
++            <span><span style={{ color:'#667085' }}>影响负荷：</span><strong style={{ color:'#eb5757' }}>{fmtUnit(result.outage_load_kw, 'kW')}</strong></span>
++            <span><span style={{ color:'#667085' }}>候选方案：</span><strong style={{ color:'#1f8a4c' }}>{hasExternalCands ? extFeasible.length + extRejected.length : result.total_plans} 个</strong></span>
++          </div>
++          {result.outage_nodes.length > 0 && <div style={{ marginTop:6, fontSize:12, color:'#667085' }}>停电节点：{result.outage_nodes.join(', ')}</div>}
++          {boundaryEdges.length > 0 && <div style={{ marginTop:4, fontSize:12, color:'#667085' }}>边界边：{boundaryEdges.map(e => `${e.line}(live:${e.source_side}→out:${e.outage_side})`).join(', ')}</div>}
++        </SectionCard>
++      )}
++
++      <div style={{ display:'flex', gap:16, flexWrap:'wrap' }}>
++        {/* left: plans */}
++        <div style={{ flex:1, minWidth:400 }}>
+           <SectionCard title={`候选方案 (${plans.length})`}>
+             {plans.length > 0 ? (
+-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
++              <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
+                 {plans.map(p => {
+                   const isSel = selectedPlan?.tie_switch === p.tie_switch;
+                   const isRec = recommended != null && recommended.tie_switch === p.tie_switch;
+@@ -237,77 +314,62 @@ export default function TransferDecision() {
+                   const sb = p.score_breakdown;
+                   return (
+                   <div key={`${p.tie_switch}-${p.rank}`} onClick={() => { setSelectedPlan(p); setConfirmed(false); }} style={{
+-                    background: isSel ? '#e8f5e9' : '#fff',
+-                    border: isSel ? '2px solid #1f8a4c' : unusable ? '1px solid #f2c94c' : '1px solid #c8d6e5',
+-                    borderRadius: 6, padding: 12, fontSize: 12, cursor: 'pointer',
+-                    opacity: unusable ? 0.92 : 1,
++                    background: isSel ? '#e8f5e9' : '#fff', border: isSel ? '2px solid #1f8a4c' : unusable ? '1px solid #f2c94c' : '1px solid #c8d6e5', borderRadius:6, padding:12, fontSize:12, cursor:'pointer', opacity: unusable ? 0.92 : 1,
+                   }}>
+-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+-                      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
++                    <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:6 }}>
++                      <div style={{ display:'flex', gap:8, alignItems:'center', flexWrap:'wrap' }}>
+                         <input type="radio" checked={isSel} onChange={() => { setSelectedPlan(p); setConfirmed(false); }} style={{ cursor:'pointer' }} />
+-                        <strong style={{ color: unusable ? '#b8860b' : '#1f8a4c', fontSize: 14 }}>
++                        <strong style={{ color: unusable ? '#b8860b' : '#1f8a4c', fontSize:14 }}>
+                           #{p.rank} {p.tie_name} ({p.tie_switch})
+-                          {isRec && <span style={{fontSize:10,color:'#f2c94c',marginLeft:4}}>★系统推荐</span>}
++                          {isRec && !isPending && <span style={{fontSize:10,color:'#f2c94c',marginLeft:4}}>★系统推荐</span>}
++                          {isRec && isPending && <span style={{fontSize:10,color:'#94a3b8',marginLeft:4}}>规则版暂选</span>}
+                         </strong>
+                         {p.score_source === 'external_matpower'
+                           ? <span style={{ fontSize:10, background:'#e3f0ff', color:'#2f80ed', border:'1px solid #90caf9', borderRadius:3, padding:'1px 6px' }}>MATPOWER评分</span>
+-                          : <span style={{ fontSize:10, background:'#f3f6f9', color:'#667085', border:'1px solid #c8d6e5', borderRadius:3, padding:'1px 6px' }}>规则评分</span>}
++                          : <span style={{ fontSize:10, background:'#fff8e1', color:'#b8860b', border:'1px solid #ffe082', borderRadius:3, padding:'1px 6px' }}>规则版预评估</span>}
+                         {p.power_flow?.converged === false && <span style={{ fontSize:10, background:'#ffebee', color:'#eb5757', border:'1px solid #ffcdd2', borderRadius:3, padding:'1px 6px' }}>潮流不收敛</span>}
+                         {p.overloaded && <span style={{ fontSize:10, background:'#ffebee', color:'#eb5757', border:'1px solid #ffcdd2', borderRadius:3, padding:'1px 6px' }}>过载风险</span>}
+-                        {p.radial_ok === false && <span style={{ fontSize:10, background:'#fff8e1', color:'#b8860b', border:'1px solid #ffe082', borderRadius:3, padding:'1px 6px' }}>可能成环，需解环操作</span>}
++                        {p.radial_ok === false && <span style={{ fontSize:10, background:'#fff8e1', color:'#b8860b', border:'1px solid #ffe082', borderRadius:3, padding:'1px 6px' }}>可能成环</span>}
+                         {unusable && <span style={{ fontSize:10, background:'#f3f6f9', color:'#667085', border:'1px solid #c8d6e5', borderRadius:3, padding:'1px 6px' }}>不可推荐</span>}
+                       </div>
+-                      <span style={{ background: unusable ? '#94a3b8' : '#1f8a4c', color: '#fff', borderRadius: 4, padding: '2px 10px', fontSize: 13, fontWeight: 700 }}>
++                      <span style={{ background: unusable ? '#94a3b8' : '#1f8a4c', color:'#fff', borderRadius:4, padding:'2px 10px', fontSize:13, fontWeight:700 }}>
+                         {p.score?.toFixed(1) ?? p.score} / 100
+                       </span>
+                     </div>
+-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 16px', color: '#667085' }}>
+-                      <span>恢复节点：<strong style={{ color: '#1f2937' }}>{p.restored_count} 个</strong></span>
+-                      <span>恢复负荷：<strong style={{ color: '#1f2937' }}>{fmtUnit(p.restored_load_kw, 'kW')}</strong></span>
+-                      <span>恢复率：<strong style={{ color: '#1f8a4c' }}>{fmtUnit(p.restoration_rate_pct, '%')}</strong></span>
+-                      <span>最低电压：<strong style={{ color: p.min_restored_voltage_pu != null && p.min_restored_voltage_pu < 0.95 ? '#eb5757' : '#1f8a4c' }}>{p.min_restored_voltage_pu != null ? `${fmtUnit(p.min_restored_voltage_pu, 'pu')} pu` : '待潮流校验'}</strong></span>
+-                      <span>负载率：<strong style={{ color: p.overloaded ? '#eb5757' : '#1f2937' }}>{p.tie_loading_pct != null ? fmtUnit(p.tie_loading_pct, '%') : '待潮流校验'}</strong></span>
++                    <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'4px 16px', color:'#667085' }}>
++                      <span>恢复节点：<strong style={{ color:'#1f2937' }}>{p.restored_count} 个</strong></span>
++                      <span>恢复负荷：<strong style={{ color:'#1f2937' }}>{fmtUnit(p.restored_load_kw, 'kW')}{p.score_source !== 'external_matpower' ? <span style={{fontSize:9,color:'#94a3b8'}}>（规则估算）</span> : ''}</strong></span>
++                      <span>恢复率：<strong style={{ color:'#1f8a4c' }}>{fmtUnit(p.restoration_rate_pct, '%')}</strong></span>
++                      <span>最低电压：<strong style={{ color: p.min_restored_voltage_pu != null && p.min_restored_voltage_pu < 0.95 ? '#eb5757' : '#1f8a4c' }}>{p.min_restored_voltage_pu != null ? `${fmtUnit(p.min_restored_voltage_pu, 'pu')} pu` : '待潮流校验'}{p.score_source !== 'external_matpower' && p.min_restored_voltage_pu != null ? <span style={{fontSize:9,color:'#94a3b8'}}>（规则估算）</span> : ''}</strong></span>
++                      <span>负载率：<strong style={{ color: p.overloaded ? '#eb5757' : '#1f2937' }}>{p.tie_loading_pct != null ? fmtUnit(p.tie_loading_pct, '%') : '待潮流校验'}{p.score_source !== 'external_matpower' && p.tie_loading_pct != null ? <span style={{fontSize:9,color:'#94a3b8'}}>（按默认容量估算）</span> : ''}</strong></span>
+                       <span>开关操作：<strong>{p.switch_operations} 次</strong></span>
+                     </div>
+                     {p.tie_loading_detail && p.tie_loading_detail.length > 0 && (
+-                      <div style={{ marginTop: 4, fontSize: 10, color: '#94a3b8' }}>
+-                        {p.tie_loading_detail.map(d => (
+-                          <span key={d.line} style={{ marginRight: 10 }}>
+-                            {d.line}: {d.loading_rate != null ? `${d.estimated_transfer_kw}kW / ${d.limit_kw}kW (${(d.loading_rate * 100).toFixed(1)}%)` : '待潮流校验'}
+-                          </span>
+-                        ))}
++                      <div style={{ marginTop:4, fontSize:10, color:'#94a3b8' }}>
++                        {p.tie_loading_detail.map(d => <span key={d.line} style={{ marginRight:10 }}>{d.line}: {d.loading_rate != null ? `${d.estimated_transfer_kw}kW / ${d.limit_kw}kW (${(d.loading_rate*100).toFixed(1)}%)` : '待潮流校验'}</span>)}
+                       </div>
+                     )}
+                     {p.power_flow && (
+-                      <div style={{ marginTop: 4, fontSize: 10, color: '#2f80ed', background: '#f0f7ff', padding: '3px 8px', borderRadius: 3 }}>
++                      <div style={{ marginTop:4, fontSize:10, color:'#2f80ed', background:'#f0f7ff', padding:'3px 8px', borderRadius:3 }}>
+                         潮流：{p.power_flow.converged === false ? '✗ 不收敛' : '✓ 收敛'}
+                         {p.power_flow.min_voltage_pu != null && ` | 最低电压 ${p.power_flow.min_voltage_pu.toFixed(3)} pu`}
+-                        {p.power_flow.max_voltage_pu != null && ` | 最高电压 ${p.power_flow.max_voltage_pu.toFixed(3)} pu`}
+                         {p.power_flow.max_loading_pct != null && ` | 最大负载率 ${p.power_flow.max_loading_pct.toFixed(1)}%`}
+                         {p.power_flow.loss_kw != null && ` | 网损 ${p.power_flow.loss_kw.toFixed(1)} kW`}
+                       </div>
+                     )}
+                     {p.violations && p.violations.length > 0 && (
+-                      <div style={{ marginTop: 4, fontSize: 10, color: '#eb5757', background: '#fff5f5', padding: '3px 8px', borderRadius: 3 }}>
+-                        约束违例：{p.violations.map((v: any, vi: number) => (
+-                          <span key={vi} style={{ marginRight: 8 }}>
+-                            {typeof v === 'string' ? v : `${v.type || v.item || '违例'}${v.detail ? `: ${v.detail}` : ''}${v.severity ? ` [${v.severity}]` : ''}`}
+-                          </span>
+-                        ))}
++                      <div style={{ marginTop:4, fontSize:10, color:'#eb5757', background:'#fff5f5', padding:'3px 8px', borderRadius:3 }}>
++                        约束违例：{p.violations.map((v: any, vi: number) => <span key={vi} style={{ marginRight:8 }}>{typeof v === 'string' ? v : `${v.type||v.item||'违例'}${v.detail?`: ${v.detail}`:''}${v.severity?` [${v.severity}]`:''}`}</span>)}
+                       </div>
+                     )}
+-                    {p.warnings && p.warnings.length > 0 && (
+-                      <div style={{ marginTop: 4, fontSize: 10, color: '#b8860b' }}>⚠ {p.warnings.join('；')}</div>
+-                    )}
++                    {p.warnings && p.warnings.length > 0 && <div style={{ marginTop:4, fontSize:10, color:'#b8860b' }}>⚠ {p.warnings.join('；')}</div>}
+                     {sb && (
+-                      <details style={{ marginTop: 6, fontSize: 10, color: '#94a3b8' }}>
+-                        <summary style={{ cursor: 'pointer' }}>评分明细{p.score_source === 'external_matpower' ? '（MATPOWER）' : '（规则版）'}</summary>
+-                        <div style={{ padding: '4px 8px' }}>
+-                          {p.score_source === 'external_matpower' ? (
+-                            <>恢复 {sb.recovery_score ?? '--'} | 电压 {sb.voltage_score ?? '--'} | 负载 {sb.loading_score ?? '--'} | 网损 {sb.loss_score ?? '--'} | 操作 {sb.operation_score ?? '--'} | 风险 {sb.risk_score ?? '--'} | 合计 {sb.total ?? p.score}</>
+-                          ) : (
+-                            <>恢复率 {sb.recovery_score}/{sb.recovery_max} | 负载率 {sb.loading_score}/{sb.loading_max} ({sb.loading_score_source}) | 电压 {sb.voltage_score}/{sb.voltage_max} | 操作 {sb.operation_score}/{sb.operation_max} | 完全恢复奖励 {sb.full_restore_bonus}/{sb.full_restore_bonus_max}</>
+-                          )}
++                      <details style={{ marginTop:6, fontSize:10, color:'#94a3b8' }}>
++                        <summary style={{ cursor:'pointer' }}>评分明细{p.score_source === 'external_matpower' ? '（MATPOWER）' : '（规则版）'}</summary>
++                        <div style={{ padding:'4px 8px' }}>
++                          {p.score_source === 'external_matpower'
++                            ? <>恢复 {sb.recovery_score??'--'} | 电压 {sb.voltage_score??'--'} | 负载 {sb.loading_score??'--'} | 网损 {sb.loss_score??'--'} | 操作 {sb.operation_score??'--'} | 风险 {sb.risk_score??'--'} | 合计 {sb.total ?? p.score}</>
++                            : <>恢复率 {sb.recovery_score}/{sb.recovery_max} | 负载率 {sb.loading_score}/{sb.loading_max} ({sb.loading_score_source}) | 电压 {sb.voltage_score}/{sb.voltage_max} | 操作 {sb.operation_score}/{sb.operation_max} | 完全恢复奖励 {sb.full_restore_bonus}/{sb.full_restore_bonus_max}</>}
+                         </div>
+                       </details>
+                     )}
+@@ -315,21 +377,18 @@ export default function TransferDecision() {
+                 );})}
+               </div>
+             ) : result ? (
+-              /* 候选方案为 0 的诊断信息 */
+-              <div style={{ fontSize: 12, color: '#667085', lineHeight: 1.8 }}>
+-                <div style={{ marginBottom: 8, color: '#eb5757', fontWeight: 600 }}>未发现可用联络线</div>
+-                <table style={{ width: '100%' }}>
+-                  <tbody>
+-                    <tr><td style={{ color: '#94a3b8', width: 130 }}>故障线路</td><td><strong>{result.fault_line}</strong></td></tr>
+-                    <tr><td style={{ color: '#94a3b8' }}>停电节点</td><td>{result.outage_nodes?.join(', ') || '无'} ({result.outage_count} 个)</td></tr>
+-                    <tr><td style={{ color: '#94a3b8' }}>边界节点</td><td>{result.boundary_nodes?.join(', ') || '无'}</td></tr>
+-                    <tr><td style={{ color: '#94a3b8' }}>IEEE33 联络线</td><td>{allTieCandidates.join(', ')}</td></tr>
+-                    <tr><td style={{ color: '#94a3b8' }}>实时 status=0 线路</td><td>{realtimeLines.filter(l => l.status === 0).map(l => l.line).join(', ') || '无'}</td></tr>
+-                  </tbody>
+-                </table>
+-                <div style={{ marginTop: 10, padding: '8px 12px', background: '#e3f0ff', borderRadius: 4, border: '1px solid #90caf9', fontSize: 11 }}>
++              <div style={{ fontSize:12, color:'#667085', lineHeight:1.8 }}>
++                <div style={{ marginBottom:8, color:'#eb5757', fontWeight:600 }}>未发现可用联络线</div>
++                <table style={{ width:'100%' }}><tbody>
++                  <tr><td style={{ color:'#94a3b8', width:130 }}>故障线路</td><td><strong>{result.fault_line}</strong></td></tr>
++                  <tr><td style={{ color:'#94a3b8' }}>停电节点</td><td>{result.outage_nodes?.join(', ') || '无'} ({result.outage_count} 个)</td></tr>
++                  <tr><td style={{ color:'#94a3b8' }}>边界节点</td><td>{result.boundary_nodes?.join(', ') || '无'}</td></tr>
++                  <tr><td style={{ color:'#94a3b8' }}>IEEE33 联络线</td><td>{allTieCandidates.join(', ')}</td></tr>
++                  <tr><td style={{ color:'#94a3b8' }}>实时 status=0 线路</td><td>{realtimeLines.filter(l=>l.status===0).map(l=>l.line).join(', ') || '无'}</td></tr>
++                </tbody></table>
++                <div style={{ marginTop:10, padding:'8px 12px', background:'#e3f0ff', borderRadius:4, border:'1px solid #90caf9', fontSize:11 }}>
+                   <strong>可能原因：</strong>
+-                  <ul style={{ margin: '4px 0 0 16px', padding: 0 }}>
++                  <ul style={{ margin:'4px 0 0 16px', padding:0 }}>
+                     <li>没有 status=0 的联络线连接停电区域和带电区域</li>
+                     <li>实时 lines 中缺少联络线数据（当前{realtimeLines.length}条）</li>
+                     <li>故障线路 downstream 全部断开，联络线不在停电区边界</li>
+@@ -338,34 +397,32 @@ export default function TransferDecision() {
+                 </div>
+               </div>
+             ) : (
+-              <div style={{ textAlign: 'center', padding: 30, color: '#94a3b8', fontSize: 13 }}>
+-                点击「执行转供决策」后，候选方案将在此显示
+-              </div>
++              <div style={{ textAlign:'center', padding:30, color:'#94a3b8', fontSize:13 }}>点击「执行转供决策」后，候选方案将在此显示</div>
+             )}
+           </SectionCard>
+         </div>
+ 
+-        {/* 右侧：当前选中方案 */}
+-        <div style={{ flex: '0 0 320px' }}>
++        {/* right: selected plan */}
++        <div style={{ flex:'0 0 320px' }}>
+           {selectedPlan ? (
+-            <SectionCard title={recommended != null && selectedPlan.tie_switch === recommended.tie_switch ? '⭐ 当前选中方案 (系统推荐)' : '📋 当前选中方案 (人工选择)'} style={{ border: '2px solid #1f8a4c', borderLeft: '4px solid #1f8a4c' }}>
+-              <div style={{ fontSize: 13, lineHeight: 2.1 }}>
+-                <div><span style={{ color:'#667085' }}>来源：</span><strong>{recommended != null && selectedPlan.tie_switch === recommended.tie_switch ? '系统推荐' : '人工选择'}</strong></div>
++            <SectionCard title={recommended != null && selectedPlan.tie_switch === recommended.tie_switch ? (isPending ? '📋 规则版暂选，待外部评分确认' : '⭐ 当前选中方案 (系统推荐)') : '📋 当前选中方案 (人工选择)'} style={{ border:'2px solid #1f8a4c', borderLeft:'4px solid #1f8a4c' }}>
++              <div style={{ fontSize:13, lineHeight:2.1 }}>
++                <div><span style={{ color:'#667085' }}>来源：</span><strong>{recommended != null && selectedPlan.tie_switch === recommended.tie_switch ? (isPending ? '规则版暂选（待外部评分确认）' : '系统推荐') : '人工选择'}</strong></div>
+                 <div><span style={{ color:'#667085' }}>联络开关：</span><strong style={{ color:'#1f8a4c' }}>{selectedPlan.tie_name} ({selectedPlan.tie_switch})</strong></div>
+-                <div><span style={{ color:'#667085' }}>恢复负荷：</span><strong>{fmtUnit(selectedPlan.restored_load_kw,'kW')}</strong></div>
++                <div><span style={{ color:'#667085' }}>恢复负荷：</span><strong>{fmtUnit(selectedPlan.restored_load_kw,'kW')}{selectedPlan.score_source !== 'external_matpower' ? <span style={{fontSize:10,color:'#94a3b8'}}>（规则估算）</span> : ''}</strong></div>
+                 <div><span style={{ color:'#667085' }}>恢复率：</span><strong style={{ color:'#1f8a4c' }}>{fmtUnit(selectedPlan.restoration_rate_pct,'%')}</strong></div>
+                 <div><span style={{ color:'#667085' }}>恢复节点数：</span><strong>{selectedPlan.restored_count} 个</strong></div>
+-                <div><span style={{ color:'#667085' }}>最低电压：</span><strong style={{ color:selectedPlan.min_restored_voltage_pu!=null&&selectedPlan.min_restored_voltage_pu<0.95?'#eb5757':'#1f8a4c' }}>{selectedPlan.min_restored_voltage_pu!=null?`${fmtUnit(selectedPlan.min_restored_voltage_pu,'pu')} pu`:'待潮流校验'}</strong></div>
+-                <div><span style={{ color:'#667085' }}>负载率：</span><strong style={{ color:selectedPlan.overloaded?'#eb5757':'#1f2937' }}>{selectedPlan.tie_loading_pct!=null?fmtUnit(selectedPlan.tie_loading_pct,'%'):'待潮流校验'}</strong></div>
++                <div><span style={{ color:'#667085' }}>最低电压：</span><strong style={{ color:selectedPlan.min_restored_voltage_pu!=null&&selectedPlan.min_restored_voltage_pu<0.95?'#eb5757':'#1f8a4c' }}>{selectedPlan.min_restored_voltage_pu!=null?`${fmtUnit(selectedPlan.min_restored_voltage_pu,'pu')} pu`:'待潮流校验'}{selectedPlan.score_source !== 'external_matpower' && selectedPlan.min_restored_voltage_pu != null ? <span style={{fontSize:10,color:'#94a3b8'}}>（规则估算）</span> : ''}</strong></div>
++                <div><span style={{ color:'#667085' }}>负载率：</span><strong style={{ color:selectedPlan.overloaded?'#eb5757':'#1f2937' }}>{selectedPlan.tie_loading_pct!=null?fmtUnit(selectedPlan.tie_loading_pct,'%'):'待潮流校验'}{selectedPlan.score_source !== 'external_matpower' && selectedPlan.tie_loading_pct != null ? <span style={{fontSize:10,color:'#94a3b8'}}>（按默认容量估算）</span> : ''}</strong></div>
+                 <div><span style={{ color:'#667085' }}>开关操作：</span><strong>{selectedPlan.switch_operations} 次</strong></div>
+                 {(selectedPlan.overloaded || selectedPlan.radial_ok === false) && (
+                   <div style={{ background:'#ffebee', border:'1px solid #ffcdd2', borderRadius:4, padding:'6px 10px', marginTop:6, fontSize:11, color:'#eb5757' }}>
+-                    {selectedPlan.overloaded && <div>⚠ 过载风险：联络线预计转供功率超过容量限值</div>}
+-                    {selectedPlan.radial_ok === false && <div>⚠ 可能成环，需解环操作</div>}
++                    {selectedPlan.overloaded && <div>⚠ 过载风险</div>}
++                    {selectedPlan.radial_ok === false && <div>⚠ 可能成环，需解环操作并通过潮流校验</div>}
+                   </div>
+                 )}
+-                <div style={{ background:'#e8f5e9',borderRadius:6,padding:'10px 14px',marginTop:8 }}>
+-                  <span style={{fontSize:12,color:'#667085'}}>综合评分：</span>
++                <div style={{ background: isPending ? '#fff8e1' : '#e8f5e9', borderRadius:6, padding:'10px 14px', marginTop:8, border: isPending ? '1px solid #f2c94c' : 'none' }}>
++                  <span style={{fontSize:12,color:'#667085'}}>综合评分{selectedPlan.score_source !== 'external_matpower' ? <span style={{fontSize:10,color:'#94a3b8'}}>（规则版临时估算，待外部评分确认）</span> : ''}：</span>
+                   <span style={{fontSize:22,fontWeight:700,color:'#1f8a4c'}}>{selectedPlan.score?.toFixed(1)??selectedPlan.score} / 100</span>
+                 </div>
+                 <div style={{ marginTop:8, fontSize:12, color:'#667085' }}>
+@@ -382,16 +439,18 @@ export default function TransferDecision() {
+                     saveWorkflowState({ transferPlan: planToSave });
+                     setConfirmed(true);
+                   }}>
+-                  {confirmed ? '✅ 已确认采用' : selectedPlan.is_usable === false ? '该方案不可采用' : '确认采用该方案'}
++                  {confirmed ? '✅ 已生成预案' : selectedPlan.is_usable === false ? '该方案不可采用' : '生成转供预案'}
+                 </button>
+                 {selectedPlan.is_usable === false && (
+-                  <div style={{ marginTop:6, fontSize:11, color:'#b8860b', background:'#fff8e1', padding:'4px 8px', borderRadius:4 }}>
+-                    该方案存在{selectedPlan.overloaded ? '过载' : ''}{selectedPlan.overloaded && selectedPlan.radial_ok === false ? '和' : ''}{selectedPlan.radial_ok === false ? '成环' : ''}风险，不能确认采用，仅供分析参考。
++                  <div style={{ marginTop:6, fontSize:11, color:'#b8860b', background:'#fff8e1', padding:'4px 8px', borderRadius:4, border:'1px solid #ffe082' }}>
++                    {selectedPlan.overloaded && <div>⚠ 过载风险</div>}
++                    {selectedPlan.radial_ok === false && <div>⚠ 可能成环：需生成解环开关操作并通过潮流校验后方可采用</div>}
++                    <div style={{ marginTop:2 }}>该方案不可作为自动推荐，仅供分析参考。</div>
+                   </div>
+                 )}
+                 {confirmed && (
+-                  <div style={{ marginTop:6, fontSize:11, color:'#1f8a4c', background:'#e8f5e9', padding:'4px 8px', borderRadius:4 }}>
+-                    已采用方案 {selectedPlan.tie_name}，后续操作序列将基于该方案生成。
++                  <div style={{ marginTop:6, fontSize:11, color:'#b8860b', background:'#fff8e1', padding:'4px 8px', borderRadius:4, border:'1px solid #ffe082' }}>
++                    已生成预案 {selectedPlan.tie_name}。当前方案尚未通过外部潮流安全校验，不可作为正式操作依据。
+                   </div>
+                 )}
+               </div>
+@@ -399,9 +458,7 @@ export default function TransferDecision() {
+           ) : result ? (
+             <SectionCard title="当前选中方案">
+               <div style={{ textAlign:'center',padding:30,color:'#94a3b8',fontSize:13 }}>
+-                {plans.length > 0 && !recommended
+-                  ? '暂无安全可推荐方案，需人工复核。可从左侧人工选择方案查看详情。'
+-                  : '请从左侧候选方案中选择'}
++                {plans.length > 0 && !recommended ? '暂无安全可推荐方案，需人工复核。' : '请从左侧候选方案中选择'}
+               </div>
+             </SectionCard>
+           ) : (

@@ -141,6 +141,8 @@ export const tieSwitches: TieSwitchPath[] = [
 export const faultScenarios: FaultScenario[] = [
   { id:'F1',label:'L4: Bus4-5 故障',lineId:'L4',faultSection:'Bus4-Bus5',lostBuses:[5,6,7,8,9,10,11,12,13,14,15,16,17,18,26,27,28,29,30,31,32,33],availableTies:['T1','T2'],description:'主馈线中段故障，下游大面积失电'},
   { id:'F2',label:'L8: Bus8-9 故障',lineId:'L8',faultSection:'Bus8-Bus9',lostBuses:[9,10,11,12,13,14,15,16,17,18],availableTies:['T2','T3','T4'],description:'常用演示场景，T2为推荐转供路径'},
+  { id:'F5',label:'L13: Bus13-14 故障',lineId:'L13',faultSection:'Bus13-Bus14',lostBuses:[14,15,16,17,18],availableTies:['T3','T4'],description:'验收流程A：预期ALG-001/T2/9-15'},
+  { id:'F6',label:'L3: Bus3-4 故障',lineId:'L3',faultSection:'Bus3-Bus4',lostBuses:[4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,23,24,25,26,27,28,29,30,31,32,33],availableTies:['T1','T2','T3','T4','T5'],description:'验收流程B：预期ALG-003/T5/25-29'},
   { id:'F3',label:'L2: Bus2-3 故障',lineId:'L2',faultSection:'Bus2-Bus3',lostBuses:[3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,23,24,25,26,27,28,29,30,31,32,33],availableTies:['T1','T2','T3','T4','T5'],description:'上游故障，大面积失电'},
   { id:'F4',label:'L25: Bus6-26 故障',lineId:'L25',faultSection:'Bus6-Bus26',lostBuses:[26,27,28,29,30,31,32,33],availableTies:['T4','T5'],description:'分支3出口故障'},
 ];

@@ -3,7 +3,7 @@ import PageContainer from '../layouts/PageContainer';
 import DataTable from '../components/DataTable';
 import SectionCard from '../components/SectionCard';
 import WorkflowProgress from '../components/WorkflowProgress';
-import { saveWorkflowState } from '../store/workflowStore';
+import { getCurrentWorkflow, saveCurrentWorkflow } from '../store/workflowStore';
 import type { OperationStep } from '../types';
 
 const stages = ['故障确认', '安全隔离', '负荷转移', '恢复供电', '方式确认'];
@@ -11,11 +11,9 @@ const stageColors: Record<string, string> = {
   '故障确认': '#ffebee', '安全隔离': '#fff8e1', '负荷转移': '#e3f0ff', '恢复供电': '#e8f5e9', '方式确认': '#f3e5f5',
 };
 
-// 后端 /api/sequence/generate 返回的步骤结构
 interface ApiOperationStep { step: number; action: string; operation_type: string; line?: string; }
 interface SequenceResponse { success: boolean; message?: string; fault_line?: string; plan_id?: string; tie_lines?: string[]; operation_steps: ApiOperationStep[]; warnings: string[]; }
 
-/** 后端操作步骤 → 页面表格行 */
 function mapStep(s: ApiOperationStep): OperationStep {
   const base = { stepNo: s.step, deviceId: s.line || '-', ruleTags: [] as string[], checkItems: [] as string[], manualConfirm: true };
   switch (s.operation_type) {
@@ -32,24 +30,34 @@ function mapStep(s: ApiOperationStep): OperationStep {
 }
 
 export default function SequenceGeneration() {
-  // 读取转供决策页面确认采用的方案（localStorage 优先）
-  const savedPlan = (() => { try { const v = localStorage.getItem('current_selected_plan'); return v ? JSON.parse(v) : null; } catch { return null; } })();
-  const savedFault = savedPlan?.fault_line || localStorage.getItem('current_fault_line') || '';
-  const hasTransferPlan = !!savedPlan;
+  // ====== 仅从 currentWorkflow 读取 ======
+  const wf = getCurrentWorkflow();
+  const selectedPlan = wf?.selected_plan || null;
+  const faultLine = wf?.fault_line || '';
+  const planId = wf?.selected_plan_id || '';
+  const tieIds = wf?.selected_tie_ids || [];
+  const tieLines = wf?.selected_tie_lines || [];
+  const hasSelectedPlan = !!selectedPlan;
 
   const [steps, setSteps] = useState<OperationStep[]>([]);
   const [seqWarnings, setSeqWarnings] = useState<string[]>([]);
-  const [planId, setPlanId] = useState('');
+  const [genPlanId, setGenPlanId] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
   const handleGenerate = async () => {
-    if (!savedPlan) { setError('请先在转供决策页面选择并确认采用一个转供方案。'); return; }
+    if (!selectedPlan) { setError('请先在转供决策页面选择并确认采用一个转供方案。'); return; }
     setLoading(true); setError('');
     try {
       const res = await fetch('http://localhost:8000/api/sequence/generate', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fault_line: savedFault, selected_plan: savedPlan }),
+        body: JSON.stringify({
+          fault_line: faultLine,
+          selected_plan: selectedPlan,
+          plan_id: planId,
+          tie_ids: tieIds,
+          tie_lines: tieLines,
+        }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json: SequenceResponse = await res.json();
@@ -57,14 +65,26 @@ export default function SequenceGeneration() {
       const mapped = (json.operation_steps || []).map(mapStep);
       setSteps(mapped);
       setSeqWarnings(json.warnings || []);
-      setPlanId(json.plan_id || '');
+      setGenPlanId(json.plan_id || '');
+      // 写回 currentWorkflow
+      saveCurrentWorkflow({
+        operation_sequence: mapped,
+        sequence_result: {
+          plan_id: json.plan_id || planId,
+          fault_line: json.fault_line || faultLine,
+          tie_lines: json.tie_lines || tieLines,
+          warnings: json.warnings || [],
+        },
+        // 清除下游
+        ticket: undefined,
+        safety_result: undefined,
+      });
+      // 同步旧 key（兼容未迁移页面）
       localStorage.setItem('current_operation_steps', JSON.stringify(json.operation_steps || []));
-      // 供模板化成票页读取 plan_id / tie_lines / fault_line
       localStorage.setItem('current_sequence_result', JSON.stringify({
-        plan_id: json.plan_id || '', fault_line: json.fault_line || savedFault,
-        tie_lines: json.tie_lines || [], warnings: json.warnings || [],
+        plan_id: json.plan_id || planId, fault_line: json.fault_line || faultLine,
+        tie_lines: json.tie_lines || tieLines, warnings: json.warnings || [],
       }));
-      saveWorkflowState({ operationSequence: mapped });
     } catch (e: any) { setError(e.message || '请求失败，请确认后端服务已启动'); }
     finally { setLoading(false); }
   };
@@ -91,19 +111,21 @@ export default function SequenceGeneration() {
     <PageContainer title="操作序列生成">
       <WorkflowProgress currentStep="sequence" />
 
-      {!hasTransferPlan && (
+      {!hasSelectedPlan && (
         <div style={{ background: '#fff8e1', border: '1px solid #ffe082', borderRadius: 6, padding: '12px 16px', marginBottom: 16, fontSize: 13 }}>
-          ⚠️ 请先在转供决策页面选择并确认采用一个转供方案。
+          ⚠️ 请先在转供决策中选择方案。当前没有任何已确认的转供方案。
         </div>
       )}
 
-      {hasTransferPlan && (
+      {hasSelectedPlan && (
         <div style={{ background: '#e8f5e9', border: '1px solid #a5d6a7', borderRadius: 6, padding: '10px 16px', marginBottom: 16, fontSize: 13, color: '#1f2937', display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-          <span>当前采用方案：<strong style={{ color: '#1f8a4c' }}>{savedPlan.tie_name} ({savedPlan.tie_switch})</strong></span>
-          {savedFault && <span>故障线路：<strong style={{ color: '#eb5757' }}>{savedFault}</strong></span>}
-          <span>恢复率：<strong>{savedPlan.restoration_rate_pct != null ? `${savedPlan.restoration_rate_pct}%` : '--'}</strong></span>
-          {savedPlan.confirmed_at && <span style={{ color: '#667085' }}>确认时间：{savedPlan.confirmed_at}（如实时拓扑已变化请重新评估）</span>}
-          {planId && <span>序列编号：<strong>{planId}</strong></span>}
+          <span>方案编号：<strong style={{ color: '#1f8a4c' }}>{planId || '-'}</strong></span>
+          <span>联络开关：<strong style={{ color: '#1f8a4c' }}>{selectedPlan.tie_name} ({selectedPlan.tie_switch})</strong></span>
+          <span>联络线：<strong>{tieLines.join('、') || '-'}</strong></span>
+          <span>故障线路：<strong style={{ color: '#eb5757' }}>{faultLine}</strong></span>
+          <span>恢复率：<strong>{selectedPlan.restoration_rate_pct != null ? `${selectedPlan.restoration_rate_pct}%` : '--'}</strong></span>
+          {selectedPlan.confirmed_at && <span style={{ color: '#667085' }}>确认时间：{selectedPlan.confirmed_at}</span>}
+          {genPlanId && <span>序列编号：<strong>{genPlanId}</strong></span>}
         </div>
       )}
 
@@ -116,7 +138,7 @@ export default function SequenceGeneration() {
         ))}
       </div>
 
-      <button onClick={handleGenerate} disabled={loading || !hasTransferPlan} className="btn-primary" style={{ marginBottom: 16, opacity: hasTransferPlan ? 1 : 0.5 }}>
+      <button onClick={handleGenerate} disabled={loading || !hasSelectedPlan} className="btn-primary" style={{ marginBottom: 16, opacity: hasSelectedPlan ? 1 : 0.5 }}>
         {loading ? '生成中...' : '生成操作序列'}
       </button>
       {error && <span style={{ color: '#eb5757', fontSize: 12, marginLeft: 12 }}>❌ {error}</span>}
@@ -140,7 +162,7 @@ export default function SequenceGeneration() {
 
       {steps.length === 0 && !loading && (
         <div style={{ textAlign: 'center', padding: 40, color: '#94a3b8', fontSize: 13 }}>
-          {hasTransferPlan
+          {hasSelectedPlan
             ? '点击「生成操作序列」根据已确认的转供方案生成结构化操作步骤'
             : '暂无已确认的转供方案，请先完成转供决策'}
         </div>

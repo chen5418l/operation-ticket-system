@@ -222,6 +222,7 @@ export default function IEEE33Topology({ predictData, realtimeData }: { predictD
         <span style={{ flex: 1 }} />
         <button onClick={doDemo}
           style={{ padding: '5px 14px', borderRadius: 4, fontSize: 11, cursor: 'pointer', background: '#1f8a4c', color: '#fff', border: 'none' }}>▶ 开始演示</button>
+        <span style={{ fontSize: 9, color: '#b8860b', background: '#fff8e1', padding: '2px 6px', borderRadius: 3, border: '1px solid #ffe082', whiteSpace: 'nowrap' }}>演示流程，不生成正式操作票</span>
         <button onClick={clearAll}
           style={{ padding: '5px 14px', borderRadius: 4, fontSize: 11, cursor: 'pointer', background: '#fff', color: '#667085', border: '1px solid #c8d6e5' }}>清除重置</button>
       </div>

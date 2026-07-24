@@ -10,7 +10,8 @@ from pydantic import BaseModel
 from app.core.database import init_db
 from app.routers import topology, fault, transfer, safety, ticket, health, safety_checker, realtime
 from app.routers import realtime as realtime_module
-from app.routers.realtime import ForecastRealtimeRequest, FaultAnalyzeRealtimeRequest, TransferEvaluateRealtimeRequest
+from app.routers.realtime import ForecastRealtimeRequest, FaultAnalyzeRealtimeRequest, TransferEvaluateRealtimeRequest, BoundaryAnalyzeRealtimeRequest, TransferRecommendRealtimeRequest, SafetyValidateRealtimeRequest
+from app.services.algorithm_client import AlgoCallResult
 
 app = FastAPI(
     title="国网江苏市级配电网智能成票与安全校验系统",
@@ -102,9 +103,162 @@ def _external_score_expired(ext: dict) -> bool:
 
 # ==================== 实时预测 + 故障分析（使用实时数据）====================
 
+def _build_local_forecast(data, nodes, horizon, interval, base_hour, base_time, forecast_mode, time_source, warnings):
+    """本地规则版源荷预测（日负荷系数 × 风险因子 × 电压因子），供外部算法不可用时兜底"""
+    HOURLY_LOAD = {0:0.78,1:0.75,2:0.73,3:0.72,4:0.74,5:0.80,6:0.88,7:0.96,8:1.02,9:1.05,10:1.08,11:1.10,12:1.06,13:1.03,14:1.00,15:1.02,16:1.08,17:1.15,18:1.22,19:1.20,20:1.14,21:1.05,22:0.95,23:0.85}
+    HOURLY_PV   = {0:0.00,1:0.00,2:0.00,3:0.00,4:0.00,5:0.05,6:0.15,7:0.35,8:0.55,9:0.75,10:0.90,11:1.00,12:1.00,13:0.92,14:0.80,15:0.65,16:0.45,17:0.20,18:0.05,19:0.00,20:0.00,21:0.00,22:0.00,23:0.00}
+    HOURLY_EV   = {0:0.60,1:0.55,2:0.50,3:0.45,4:0.45,5:0.50,6:0.60,7:0.75,8:0.85,9:0.80,10:0.75,11:0.70,12:0.75,13:0.78,14:0.80,15:0.85,16:0.95,17:1.15,18:1.35,19:1.45,20:1.40,21:1.25,22:1.05,23:0.80}
+    def lf(h): return HOURLY_LOAD.get(h % 24, 1.0)
+    def pf(h): return HOURLY_PV.get(h % 24, 0.0)
+    def ef(h): return HOURLY_EV.get(h % 24, 1.0)
+    def rf(r): return {"low": 1.00, "medium": 1.03, "high": 1.06}.get(r, 1.00)
+    def vf(v): return 1.05 if v < 0.95 else (1.02 if v < 0.97 else 1.00)
+    cur_load = round(sum(n.get("load_kw", 0) for n in nodes), 3)
+    cur_pv = round(sum(n.get("pv_kw", 0) for n in nodes), 3)
+    cur_ev = round(sum(n.get("ev_kw", 0) for n in nodes), 3)
+    node_forecasts = []
+    for n in nodes:
+        nd = n.get("node", 0); v = n.get("voltage_pu", 1.0); rl = n.get("risk_level", "low")
+        l0, pv0, ev0 = n.get("load_kw", 0), n.get("pv_kw", 0), n.get("ev_kw", 0)
+        series = []
+        for s in range(1, horizon + 1):
+            fh = (base_hour + s * interval // 60) % 24; t_off = s * interval
+            fl = round(l0 * lf(fh) * rf(rl) * vf(v), 3)
+            fp = round(pv0 * pf(fh), 3); fe = round(ev0 * ef(fh), 3)
+            series.append({"step": s, "time_offset_min": t_off, "forecast_hour": fh,
+                           "forecast_load_kw": fl, "forecast_pv_kw": fp, "forecast_ev_kw": fe,
+                           "forecast_net_load_kw": round(fl + fe - fp, 3)})
+        node_forecasts.append({"node": nd, "current_load_kw": l0, "current_pv_kw": pv0,
+                               "current_ev_kw": ev0, "current_net_load_kw": round(l0 + ev0 - pv0, 3),
+                               "voltage_pu": v, "risk_level": rl, "series": series})
+    forecast_series = []
+    for s in range(1, horizon + 1):
+        fh = (base_hour + s * interval // 60) % 24; t_off = s * interval
+        tl = round(sum(n.get("load_kw",0)*lf(fh)*rf(n.get("risk_level","low"))*vf(n.get("voltage_pu",1.0)) for n in nodes), 3)
+        tp = round(sum(n.get("pv_kw",0)*pf(fh) for n in nodes), 3)
+        te = round(sum(n.get("ev_kw",0)*ef(fh) for n in nodes), 3)
+        forecast_series.append({"step": s, "time_offset_min": t_off, "forecast_hour": fh,
+                                "total_load_kw": tl, "total_pv_kw": tp, "total_ev_kw": te,
+                                "total_net_load_kw": round(tl+te-tp, 3)})
+    # 风险节点：净负荷峰值增长率 > 10% 或电压 < 0.97
+    risk_nodes = []
+    for nf in node_forecasts:
+        max_net = max((s["forecast_net_load_kw"] for s in nf["series"]), default=nf["current_net_load_kw"])
+        r = nf["risk_level"]
+        if r == "high" or r == "medium" or nf["voltage_pu"] < 0.97 or (
+           nf["current_net_load_kw"] > 0 and (max_net - nf["current_net_load_kw"]) / max(nf["current_net_load_kw"], 1) > 0.1):
+            risk_nodes.append({"node": nf["node"], "risk_level": r, "voltage_pu": nf["voltage_pu"],
+                               "current_net_load_kw": nf["current_net_load_kw"], "peak_net_load_kw": max_net})
+    return {
+        "success": True, "has_data": True,
+        "algorithm_source": "local_fallback",
+        "confidence": "low",
+        "source": "realtime",
+        "source_tag": realtime_module._latest_source or "none",
+        "trusted_source": realtime_module._latest_trusted or False,
+        "timestamp": data.get("timestamp", "") or (realtime_module._last_update or ""),
+        "base_time": base_time, "base_hour": base_hour,
+        "forecast_mode": forecast_mode, "time_source": time_source,
+        "horizon": horizon, "interval_minutes": interval,
+        "message": "本地规则版源荷预测（未接入外部预测算法，结果需人工复核）",
+        "current_total_load_kw": cur_load,
+        "current_total_pv_kw": cur_pv,
+        "current_total_ev_kw": cur_ev,
+        "current_total_net_load_kw": round(cur_load + cur_ev - cur_pv, 3),
+        "forecast_series": forecast_series, "node_forecasts": node_forecasts,
+        "risk_nodes": risk_nodes,
+        "diagnostics": {
+            "realtime_node_count": len(nodes),
+            "realtime_total_load_kw": cur_load, "realtime_total_pv_kw": cur_pv,
+            "realtime_total_ev_kw": cur_ev, "used_realtime_nodes": True,
+            "used_static_fallback": False,
+            "field_check": {"has_pv_kw": cur_pv > 0, "has_ev_kw": cur_ev > 0},
+        },
+        "warnings": warnings,
+    }
+
+
+def compute_time_index(ts: Optional[str] = None) -> int:
+    """一天 288 点（5分钟粒度），范围 1~288。公式: floor((h*60+m)/5) + 1"""
+    if ts:
+        for f in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S", "%H:%M"):
+            try: dt = datetime.strptime(str(ts).strip(), f); break
+            except ValueError: pass
+        else: dt = datetime.now()
+    else:
+        dt = datetime.now()
+    return (dt.hour * 60 + dt.minute) // 5 + 1
+
+
+def _map_forecast_risk_level(level: str) -> str:
+    """外部算法 risk_level: High/Medium → high/medium/low"""
+    v = str(level or "").strip().lower()
+    return v if v in ("high", "medium", "low") else "low"
+
+
+def _normalize_external_forecast(ext: dict, nodes: list, warnings: list) -> dict:
+    """将 IEEE33 算法服务 /api/v1/forecast/realtime 返回值标准化为业务前端结构"""
+    ext_ts = ext.get("timestamp") or realtime_module._last_update or ""
+
+    # forecast_series：兼容 forecasts[] 包裹结构
+    series = ext.get("forecast_series") or ext.get("series") or []
+    if not series and isinstance(ext.get("forecasts"), list):
+        series = ext["forecasts"]
+
+    # node_forecasts：兼容 forecasts[].nodes[] 扁平化
+    node_fcasts = ext.get("node_forecasts") or []
+    if not node_fcasts and isinstance(ext.get("forecasts"), list):
+        flat = []
+        for f in ext["forecasts"]:
+            for n in (f.get("nodes") or []):
+                flat.append({
+                    "node": n.get("node") or n.get("bus", 0),
+                    "forecast_hour": f.get("forecast_hour") or f.get("step", 0),
+                    "forecast_load_kw": n.get("p_load_kw") or n.get("forecast_load_kw", 0),
+                    "forecast_pv_kw": n.get("p_pv_kw") or n.get("forecast_pv_kw", 0),
+                    "forecast_ev_kw": n.get("p_ev_kw") or n.get("forecast_ev_kw", 0),
+                    "forecast_net_load_kw": (n.get("p_load_kw") or n.get("forecast_load_kw", 0))
+                                           + (n.get("p_ev_kw") or n.get("forecast_ev_kw", 0))
+                                           - (n.get("p_pv_kw") or n.get("forecast_pv_kw", 0)),
+                })
+        node_fcasts = flat
+
+    # risk_nodes：标准化 risk_level + reasons → risk_reason
+    risk = ext.get("risk_nodes") or ext.get("risk_nodes_list") or []
+    norm_risk = []
+    for rn in risk:
+        nr = dict(rn)
+        nr["risk_level"] = _map_forecast_risk_level(nr.get("risk_level", "low"))
+        reasons = nr.get("reasons") or nr.get("risk_reason") or []
+        if isinstance(reasons, str):
+            reasons = [reasons]
+        nr["risk_reason"] = reasons
+        norm_risk.append(nr)
+
+    cur_load = ext.get("current_total_load_kw") or round(sum(n.get("load_kw",0) for n in nodes), 3)
+
+    return {
+        "success": True, "has_data": True,
+        "algorithm_source": "external",
+        "algorithm": ext.get("algorithm") or "ieee33",
+        "algorithm_version": ext.get("algorithm_version") or "",
+        "trusted_source": realtime_module._latest_trusted or False,
+        "timestamp": ext_ts,
+        "current_total_load_kw": cur_load,
+        "current_total_pv_kw": ext.get("current_total_pv_kw", 0),
+        "current_total_ev_kw": ext.get("current_total_ev_kw", 0),
+        "current_total_net_load_kw": ext.get("current_total_net_load_kw") or (cur_load + ext.get("current_total_ev_kw", 0) - ext.get("current_total_pv_kw", 0)),
+        "forecast_series": series,
+        "node_forecasts": node_fcasts,
+        "risk_nodes": norm_risk,
+        "message": "基于 IEEE33 算法服务完成源荷预测",
+        "warnings": warnings,
+    }
+
+
 @app.post("/api/forecast/realtime")
 def forecast_realtime(req: ForecastRealtimeRequest):
-    """基于实时 Simulink 数据做多步源荷预测"""
+    """源荷预测统一接口：优先调用 IEEE33 算法服务 POST /api/v1/forecast/realtime"""
     data = realtime_module._latest_data
     if data is None or not data.get("nodes"):
         return {
@@ -122,17 +276,11 @@ def forecast_realtime(req: ForecastRealtimeRequest):
     # ---- 基准时间解析 ----
     horizon = max(1, min(48, getattr(req, 'horizon_hours', 0) or req.horizon))
     interval = max(5, min(120, req.interval_minutes))
-
     ts_str = realtime_module._last_update or ""
-    base_time = ""
-    time_source = "server_time"
-    forecast_mode = "realtime"
-
+    base_time, time_source, forecast_mode = "", "server_time", "realtime"
     if req.base_hour >= 0:
-        base_hour = req.base_hour % 24
-        base_time = f"{base_hour:02d}:00"
-        time_source = "manual_override"
-        forecast_mode = "scenario"
+        base_hour = req.base_hour % 24; base_time = f"{base_hour:02d}:00"
+        time_source = "manual_override"; forecast_mode = "scenario"
     elif ts_str:
         try:
             for fmt_str in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S", "%H:%M"):
@@ -140,138 +288,160 @@ def forecast_realtime(req: ForecastRealtimeRequest):
                     dt = datetime.strptime(ts_str.strip(), fmt_str)
                     base_hour = dt.hour
                     base_time = dt.strftime("%Y-%m-%d %H:%M:%S") if dt.year > 2000 else dt.strftime("%H:%M:%S")
-                    time_source = "realtime_timestamp"
-                    break
-                except ValueError:
-                    continue
+                    time_source = "realtime_timestamp"; break
+                except ValueError: continue
             else:
                 base_hour = datetime.now().hour; base_time = datetime.now().strftime("%H:%M:%S")
         except Exception:
             base_hour = datetime.now().hour; base_time = datetime.now().strftime("%H:%M:%S")
     else:
         base_hour = datetime.now().hour; base_time = datetime.now().strftime("%H:%M:%S")
-
     base_hour = base_hour % 24
 
-    # ---- 24小时日负荷系数 ----
-    HOURLY_LOAD = {0:0.78,1:0.75,2:0.73,3:0.72,4:0.74,5:0.80,6:0.88,7:0.96,8:1.02,9:1.05,10:1.08,11:1.10,12:1.06,13:1.03,14:1.00,15:1.02,16:1.08,17:1.15,18:1.22,19:1.20,20:1.14,21:1.05,22:0.95,23:0.85}
-    HOURLY_PV   = {0:0.00,1:0.00,2:0.00,3:0.00,4:0.00,5:0.05,6:0.15,7:0.35,8:0.55,9:0.75,10:0.90,11:1.00,12:1.00,13:0.92,14:0.80,15:0.65,16:0.45,17:0.20,18:0.05,19:0.00,20:0.00,21:0.00,22:0.00,23:0.00}
-    HOURLY_EV   = {0:0.60,1:0.55,2:0.50,3:0.45,4:0.45,5:0.50,6:0.60,7:0.75,8:0.85,9:0.80,10:0.75,11:0.70,12:0.75,13:0.78,14:0.80,15:0.85,16:0.95,17:1.15,18:1.35,19:1.45,20:1.40,21:1.25,22:1.05,23:0.80}
+    # ---- IEEE33 算法服务桥接：源荷预测 ----
+    from app.services.ieee33_algorithm_client import forecastRealtime as algo_forecast
+    ti = compute_time_index(ts_str)
+    algo_payload = {
+        "request_id": f"fcst_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+        "timestamp": ts_str,
+        "time_index": ti,
+        "horizon_steps": horizon,
+        "step_minutes": interval,
+        "include_risk": True,
+        "snapshot": {
+            "timestamp": ts_str,
+            "time_index": ti,
+            "nodes": nodes,
+            "lines": data.get("lines", []),
+            "switches": data.get("switches", {}),
+        },
+    }
+    algo_result = algo_forecast(algo_payload)
+    if algo_result.available and algo_result.ok:
+        normalized = _normalize_external_forecast(algo_result.data, nodes, warnings)
+        normalized["diagnostics"] = {**algo_result.to_dict(), "algorithm_source": "external"}
+        return normalized
 
-    def load_factor_for_hour(h: int) -> float: return HOURLY_LOAD.get(h % 24, 1.0)
-    def pv_factor_for_hour(h: int) -> float: return HOURLY_PV.get(h % 24, 0.0)
-    def ev_factor_for_hour(h: int) -> float: return HOURLY_EV.get(h % 24, 1.0)
+    # ---- 本地规则兜底（未配置或外部调用失败均走此路径）----
+    if algo_result.available is not None and not algo_result.available and algo_result.error == "not_configured":
+        warnings.append("外部预测算法接口暂未接入，当前使用本地规则预测，结果需人工复核")
+    else:
+        warnings.append("外部预测算法服务暂不可用，已降级本地规则预测，结果需人工复核")
+    return _build_local_forecast(data, nodes, horizon, interval, base_hour, base_time,
+                                  forecast_mode, time_source, warnings)
 
-    def risk_factor(risk: str) -> float:
-        m = {"low": 1.00, "medium": 1.03, "high": 1.06}
-        return m.get(risk, 1.00)
 
-    def voltage_factor(v: float) -> float:
-        if v < 0.95:
-            return 1.05
-        elif v < 0.97:
-            return 1.02
-        return 1.00
+def _run_local_fault_bfs(data, nodes, lines_data, fault_key, src_tag, trusted, warnings, parse_errors):
+    """本地 BFS 故障分析（拓扑兜底）。algorithm_source=local_fallback"""
+    node_map = {n.get("node", 0): n for n in nodes}
+    # ---- 构建邻接表 ----
+    adj = {}
+    all_pairs = set()
+    tie_candidates = []
+    for l in lines_data:
+        ln = l.get("line", ""); st = l.get("status", 1)
+        pair = parse_line_pair(ln)
+        if pair is None:
+            parse_errors.append(f"无法解析线路: {ln}")
+            continue
+        key = f"{pair[0]}-{pair[1]}"
+        all_pairs.add(pair)
+        if key == fault_key:
+            continue  # 故障线路本身断开
+        if st == 0:
+            tie_candidates.append({**l, "line": key})
+        if st == 1:
+            aid, bid = f"BUS-{pair[0]:02d}", f"BUS-{pair[1]:02d}"
+            adj.setdefault(aid, []).append(bid); adj.setdefault(bid, []).append(aid)
+    if parse_errors:
+        warnings.extend(parse_errors[:5])
 
-    # ---- 当前汇总 ----
-    cur_load = round(sum(n.get("load_kw", 0) for n in nodes), 3)
-    cur_pv = round(sum(n.get("pv_kw", 0) for n in nodes), 3)
-    cur_ev = round(sum(n.get("ev_kw", 0) for n in nodes), 3)
-    cur_net = round(cur_load + cur_ev - cur_pv, 3)
+    # ---- BFS ----
+    visited = set(); q = ["BUS-01"]
+    while q:
+        u = q.pop(0)
+        if u in visited: continue
+        visited.add(u)
+        for v in adj.get(u, []):
+            if v not in visited: q.append(v)
 
-    # ---- 逐节点 + 全网预测 ----
-    node_forecasts = []
-    for n in nodes:
-        nd = n.get("node", 0)
-        v = n.get("voltage_pu", 1.0)
-        risk = n.get("risk_level", "low")
-        l0 = n.get("load_kw", 0)
-        pv0 = n.get("pv_kw", 0)
-        ev0 = n.get("ev_kw", 0)
-        vf = voltage_factor(v)
-        rf = risk_factor(risk)
-        series = []
-        for s in range(1, horizon + 1):
-            fh = (base_hour + s * interval // 60) % 24
-            t_off = s * interval
-            ltf = load_factor_for_hour(fh)
-            ptf = pv_factor_for_hour(fh)
-            etf = ev_factor_for_hour(fh)
-            fl = round(l0 * ltf * rf * vf, 3)
-            fp = round(pv0 * ptf, 3)
-            fe = round(ev0 * etf, 3)
-            series.append({
-                "step": s, "time_offset_min": t_off, "forecast_hour": fh,
-                "forecast_load_kw": fl, "forecast_pv_kw": fp, "forecast_ev_kw": fe,
-                "forecast_net_load_kw": round(fl + fe - fp, 3),
+    all_ids = {f"BUS-{n.get('node', 0):02d}" for n in nodes}
+    outage_nums = [int(x.replace("BUS-", "")) for x in sorted(all_ids - visited)]
+    reachable_nums = [int(x.replace("BUS-", "")) for x in sorted(visited)]
+
+    # ---- 边界 ----
+    boundary_nodes = []
+    boundary_edges = []
+    for (a, b) in all_pairs:
+        a_live, b_live = a in reachable_nums, b in reachable_nums
+        if a_live != b_live:
+            boundary_nodes.append(f"{a}-{b}")
+            boundary_edges.append({"line": f"{a}-{b}", "source_side": a if a_live else b, "outage_side": b if a_live else a})
+
+    # ---- 候选联络开关 ----
+    candidate_tie_switches = []
+    seen = set()
+    for l in tie_candidates:
+        ln = l.get("line", "")
+        pair = parse_line_pair(ln)
+        if pair is None or ln in seen: continue
+        seen.add(ln)
+        an, bn = pair
+        if (an in reachable_nums) != (bn in reachable_nums):
+            candidate_tie_switches.append({
+                "line": ln, "from": an, "to": bn, "status": l.get("status", 0),
+                "current_a": l.get("current_a", 0), "power_kw": l.get("power_kw", 0),
+                "reason": "该联络线连接带电区域与停电区域，可作为转供候选",
             })
-        node_forecasts.append({
-            "node": nd,
-            "current_load_kw": l0, "current_pv_kw": pv0,
-            "current_ev_kw": ev0, "current_net_load_kw": round(l0 + ev0 - pv0, 3),
-            "voltage_pu": v, "risk_level": risk, "series": series,
-        })
 
-    # ---- 全网预测序列 ----
-    forecast_series = []
-    for s in range(1, horizon + 1):
-        fh = (base_hour + s * interval // 60) % 24
-        t_off = s * interval
-        ltf = load_factor_for_hour(fh)
-        ptf = pv_factor_for_hour(fh)
-        etf = ev_factor_for_hour(fh)
-        tl = round(sum(n.get("load_kw",0)*ltf*risk_factor(n.get("risk_level","low"))*voltage_factor(n.get("voltage_pu",1.0)) for n in nodes),3)
-        tp = round(sum(n.get("pv_kw",0)*ptf for n in nodes),3)
-        te = round(sum(n.get("ev_kw",0)*etf for n in nodes),3)
-        forecast_series.append({
-            "step": s, "time_offset_min": t_off, "forecast_hour": fh,
-            "total_load_kw": tl, "total_pv_kw": tp, "total_ev_kw": te,
-            "total_net_load_kw": round(tl+te-tp,3),
-        })
+    current_total = round(sum(n.get("load_kw", 0) for n in nodes), 2)
+    affected_load = round(sum(node_map.get(nid, {}).get("load_kw", 0) for nid in outage_nums), 2)
+
+    # 安全计算 min/max voltage node（节点编号来自 node 字段，非列表索引）
+    min_entry = min(nodes, key=lambda n: float(n.get("voltage_pu", 1.0)), default=None)
+    max_entry = max(nodes, key=lambda n: float(n.get("voltage_pu", 1.0)), default=None)
+    min_v = float(min_entry.get("voltage_pu", 1.0)) if min_entry else 0
+    max_v = float(max_entry.get("voltage_pu", 1.0)) if max_entry else 0
+    min_v_node = int(min_entry.get("node", 0)) if min_entry else None
+    max_v_node = int(max_entry.get("node", 0)) if max_entry else None
 
     return {
         "success": True, "has_data": True,
-        "source": "realtime",
-        "source_tag": realtime_module._latest_source or "none",
-        "trusted_source": realtime_module._latest_trusted or False,
-        "timestamp": data.get("timestamp", ""),
-        "base_time": base_time,
-        "base_hour": base_hour,
-        "forecast_mode": forecast_mode,
-        "time_source": time_source,
-        "horizon": horizon, "interval_minutes": interval,
-        "message": "基于 Simulink 实时数据完成24小时源荷预测" if forecast_mode == "realtime" else "场景推演模式：基准时间由用户手动指定",
-        "current_total_load_kw": cur_load,
-        "current_total_pv_kw": cur_pv,
-        "current_total_ev_kw": cur_ev,
-        "current_total_net_load_kw": cur_net,
-        "forecast_series": forecast_series,
-        "node_forecasts": node_forecasts,
-        "diagnostics": {
-            "realtime_node_count": len(nodes),
-            "realtime_total_load_kw": cur_load,
-            "realtime_total_pv_kw": cur_pv,
-            "realtime_total_ev_kw": cur_ev,
-            "used_realtime_nodes": True,
-            "used_static_fallback": False,
-            "field_check": {"has_pv_kw": cur_pv > 0, "has_ev_kw": cur_ev > 0},
+        "algorithm_source": "local_fallback",
+        "source": "realtime", "source_tag": src_tag, "trusted_source": trusted,
+        "timestamp": data.get("timestamp", "") or (realtime_module._last_update or ""),
+        "message": "本地 BFS 拓扑分析（仅为拓扑兜底，外部故障分析算法未配置；结果需人工复核）",
+        "fault_line": fault_key, "source_node": 1,
+        "reachable_nodes": reachable_nums, "outage_nodes": outage_nums,
+        "boundary_nodes": boundary_nodes, "boundary_edges": boundary_edges,
+        "candidate_tie_switches": candidate_tie_switches,
+        "current_total_load_kW": current_total, "affected_load_kW": affected_load,
+        "affected_count": len(outage_nums), "reachable_count": len(reachable_nums),
+        "powered_nodes": reachable_nums,
+        "affected_node_details": [
+            {"node": nid, "load_kw": node_map.get(nid, {}).get("load_kw", 0),
+             "voltage_pu": node_map.get(nid, {}).get("voltage_pu", 0),
+             "pv_kw": node_map.get(nid, {}).get("pv_kw", 0),
+             "ev_kw": node_map.get(nid, {}).get("ev_kw", 0),
+             "risk_level": node_map.get(nid, {}).get("risk_level", "low")}
+            for nid in outage_nums
+        ],
+        "power_flow_summary": {
+            "min_voltage_pu": round(min_v, 4), "min_voltage_node": min_v_node,
+            "max_voltage_pu": round(max_v, 4), "max_voltage_node": max_v_node,
         },
+        "diagnostics": {"algorithm_source": "local_fallback"},
         "warnings": warnings,
     }
 
 
 @app.post("/api/fault/analyze-realtime")
 def fault_analyze_realtime(req: FaultAnalyzeRealtimeRequest):
-    """
-    基于实时 Simulink 数据做 IEEE 33节点 BFS 故障分析。
-    lines[].line 格式 "13-14" 解析 from/to；
-    lines[].status 判断闭合/断开。
-    """
+    """故障分析统一接口：外部算法优先，不可用时按是否配置分流"""
     data = realtime_module._latest_data
     if data is None or not data.get("nodes"):
         return {
-            "success": False,
-            "has_data": False,
+            "success": False, "has_data": False,
             "message": "暂无实时数据，请先接入Simulink数据",
             "warnings": ["暂无实时数据，请先接入Simulink数据"],
         }
@@ -283,7 +453,6 @@ def fault_analyze_realtime(req: FaultAnalyzeRealtimeRequest):
     trusted = realtime_module._latest_trusted or False
     node_map = {n.get("node", 0): n for n in nodes}
 
-    # 校验并归一化 fault_line（"9-8" 与 "8-9" 等价）
     if parse_line_pair(fault_str) is None:
         return {"success": False, "message": f"故障线路格式非法: {fault_str}，需为数字-数字"}
     fault_key = normalize_line_key(fault_str)
@@ -293,159 +462,687 @@ def fault_analyze_realtime(req: FaultAnalyzeRealtimeRequest):
     if not trusted:
         warnings.append("当前数据源未验证，结果需人工复核")
 
-    # ---- 构建邻接表 ----
-    adj = {}
-    all_pairs = set()
-    tie_candidates = []
+    # ---- IEEE33 算法服务桥接：故障分析 ----
+    from app.services.ieee33_algorithm_client import faultAnalyze as algo_fault_analyze
+    algo_result = algo_fault_analyze({
+        "request_id": f"fault_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+        "fault_line": fault_key,
+        "timestamp": realtime_module._last_update or "",
+        "snapshot": {"nodes": nodes, "lines": lines_data, "switches": data.get("switches", {})},
+    })
+    if algo_result.available and algo_result.ok:
+        ext = algo_result.data
+        # 标准化字段：fault_analysis.dead_buses → outage_nodes；fault_analysis.outage_nodes → outage_nodes
+        fa = ext.get("fault_analysis") or {}
+        outage_raw = (ext.get("outage_nodes") or fa.get("outage_nodes") or
+                      fa.get("dead_buses") or ext.get("dead_buses") or [])
+        if isinstance(outage_raw, list) and outage_raw:
+            outage_nums = [int(x) for x in outage_raw]
+            reachable_nums = [i for i in range(1, 34) if i not in outage_nums]
+            affected_load = ext.get("affected_load_kw") or fa.get("affected_load_kw") or round(
+                sum(node_map.get(nid, {}).get("load_kw", 0) for nid in outage_nums), 2)
+            cur_total = round(sum(n.get("load_kw", 0) for n in nodes), 2)
+            # 候选联络开关标准化
+            cands = (ext.get("candidate_tie_switches") or fa.get("candidate_tie_switches") or
+                     ext.get("candidates") or [])
+            candidate_tie_switches = []
+            for tc in cands:
+                tl = tc.get("line") or tc.get("tie_line") or ""
+                pair = parse_line_pair(str(tl))
+                if pair:
+                    candidate_tie_switches.append({
+                        "line": f"{pair[0]}-{pair[1]}", "from": pair[0], "to": pair[1],
+                        "status": tc.get("status", 0),
+                        "current_a": tc.get("current_a") or tc.get("current", 0),
+                        "power_kw": tc.get("power_kw") or tc.get("power", 0),
+                        "reason": tc.get("reason", "外部算法推荐"),
+                    })
+            return {
+                "success": True, "has_data": True,
+                "algorithm_source": "external",
+                "source": "realtime", "source_tag": src_tag, "trusted_source": trusted,
+                "timestamp": ext.get("timestamp") or realtime_module._last_update or "",
+                "message": "基于 IEEE33 算法服务完成故障分析",
+                "fault_line": fault_key,
+                "fault_analysis": fa,
+                "outage_nodes": outage_nums,
+                "dead_buses": fa.get("dead_buses") or outage_nums,
+                "affected_load_kW": affected_load,
+                "service_interruption": ext.get("service_interruption") or fa.get("service_interruption") or False,
+                "affected_count": len(outage_nums),
+                "reachable_nodes": reachable_nums, "reachable_count": len(reachable_nums),
+                "powered_nodes": reachable_nums,
+                "boundary_nodes": ext.get("boundary_nodes") or [],
+                "boundary_edges": ext.get("boundary_edges") or [],
+                "candidate_tie_switches": candidate_tie_switches,
+                "current_total_load_kW": cur_total,
+                "affected_node_details": [
+                    {"node": nid, "load_kw": node_map.get(nid, {}).get("load_kw", 0),
+                     "voltage_pu": node_map.get(nid, {}).get("voltage_pu", 0),
+                     "pv_kw": node_map.get(nid, {}).get("pv_kw", 0), "ev_kw": node_map.get(nid, {}).get("ev_kw", 0),
+                     "risk_level": node_map.get(nid, {}).get("risk_level", "low")}
+                    for nid in outage_nums
+                ],
+                "power_flow_summary": ext.get("power_flow_summary") or {},
+                "diagnostics": {**algo_result.to_dict(), "algorithm_source": "external"},
+                "warnings": warnings + ([algo_result.warning] if algo_result.warning else []),
+            }
+        # 返回无有效数据 → 走 fallback
 
-    for l in lines_data:
-        ln = l.get("line", "")
-        st = l.get("status", 1)
-        pair = parse_line_pair(ln)
-        if pair is None:
-            parse_errors.append(f"无法解析线路: {ln}")
-            continue
-        key = f"{pair[0]}-{pair[1]}"
-        all_pairs.add(pair)
-        if key == fault_key:
-            # 故障线路本身：从基础图中断开，且不得作为联络候选
-            continue
-        if st == 0:
-            tie_candidates.append({**l, "line": key})
-        if st == 1:
-            aid, bid = f"BUS-{pair[0]:02d}", f"BUS-{pair[1]:02d}"
-            adj.setdefault(aid, []).append(bid)
-            adj.setdefault(bid, []).append(aid)
+    # 外部已配置但不可用
+    if not algo_result.available and algo_result.error != "not_configured":
+        return {
+            "success": False, "has_data": True,
+            "algorithm_source": "external_unavailable",
+            "message": "外部故障分析算法服务暂不可用，结果需人工复核",
+            "fault_line": fault_key,
+            "outage_nodes": [], "candidate_tie_switches": [],
+            "diagnostics": algo_result.to_dict(),
+            "warnings": warnings + ["外部故障分析算法服务暂不可用，结果需人工复核"],
+        }
 
-    if parse_errors:
-        warnings.extend(parse_errors[:5])
+    # ---- 本地 BFS 拓扑兜底 ----
+    warnings.append("外部故障分析算法服务暂不可用，已使用本地拓扑算法兜底，结果需人工复核")
+    return _run_local_fault_bfs(data, nodes, lines_data, fault_key, src_tag, trusted, warnings, parse_errors)
 
-    # ---- BFS 从 BUS-01 ----
-    visited = set()
-    queue = ["BUS-01"]
-    while queue:
-        u = queue.pop(0)
-        if u in visited:
-            continue
-        visited.add(u)
-        for v in adj.get(u, []):
-            if v not in visited:
-                queue.append(v)
 
-    all_ids = {f"BUS-{n.get('node', 0):02d}" for n in nodes}
-    outage = sorted(all_ids - visited)
-    powered = sorted(visited)
-    outage_nums = [int(x.replace("BUS-", "")) for x in outage]
-    reachable_nums = [int(x.replace("BUS-", "")) for x in powered]
+# ---- IEEE33 固定拓扑线路（用于节点→关联线路映射）----
+_IEEE33_TOPOLOGY_LINES = [
+    (1,2),(2,3),(3,4),(4,5),(5,6),(6,7),(7,8),(8,9),(9,10),(10,11),(11,12),
+    (12,13),(13,14),(14,15),(15,16),(16,17),(17,18),(2,19),(19,20),(20,21),
+    (21,22),(3,23),(23,24),(24,25),(6,26),(26,27),(27,28),(28,29),(29,30),
+    (30,31),(31,32),(32,33),(21,8),(9,15),(12,22),(18,33),(25,29),
+]
+_IEEE33_NODE_LINES_CACHE = {}  # node_id → [line_str, ...]
+def _get_related_lines_for_node(node_id: int) -> list:
+    if node_id not in _IEEE33_NODE_LINES_CACHE:
+        lines = []
+        for a, b in _IEEE33_TOPOLOGY_LINES:
+            if node_id == a or node_id == b:
+                lines.append(f"{min(a,b)}-{max(a,b)}")
+        _IEEE33_NODE_LINES_CACHE[node_id] = lines
+    return _IEEE33_NODE_LINES_CACHE[node_id]
 
-    # ---- 边界节点 + 边界边 ----
-    boundary_nodes = []
-    boundary_edges = []
-    for (a, b) in all_pairs:
-        a_live = a in reachable_nums
-        b_live = b in reachable_nums
-        if a_live != b_live:
-            boundary_nodes.append(f"{a}-{b}")
-            boundary_edges.append({
-                "line": f"{a}-{b}",
-                "source_side": a if a_live else b,
-                "outage_side": b if a_live else a,
-            })
+def _evaluate_realtime_risk(nodes: list, lines_data: list = None) -> list:
+    """实时电压风险筛查（第一层：仅电压）"""
+    result = []
+    for node in nodes:
+        node_id = int(node.get("node", 0))
+        voltage = float(node.get("voltage_pu") or 1.0)
+        load_kw = float(node.get("load_kw") or 0)
+        # 电压风险判定
+        if voltage < 0.95:
+            level, risk_type = "high", "undervoltage"
+            reason = f"节点电压 {voltage:.4f} pu，低于0.95 pu"
+        elif voltage > 1.05:
+            level, risk_type = "high", "overvoltage"
+            reason = f"节点电压 {voltage:.4f} pu，高于1.05 pu"
+        elif voltage < 0.97:
+            level, risk_type = "medium", "voltage_margin"
+            reason = f"节点电压 {voltage:.4f} pu，低于关注阈值 0.970 pu"
+        elif voltage > 1.03:
+            level, risk_type = "medium", "voltage_margin"
+            reason = f"节点电压 {voltage:.4f} pu，高于关注阈值 1.030 pu"
+        else:
+            level, risk_type = "low", "normal"
+            reason = "当前电压在正常范围"
+        # 关联线路
+        related = _get_related_lines_for_node(node_id)
+        # 推荐线路：第一条关联线路
+        recommended = related[0] if related else None
+        result.append({
+            "node": node_id,
+            "voltage_pu": voltage,
+            "load_kw": load_kw,
+            "risk_level": level,
+            "risk_type": risk_type,
+            "reason": reason,
+            "related_lines": related,
+            "recommended_line": recommended,
+        })
+    return result
 
-    # ---- 候选联络开关（已排除故障线路本身）----
-    candidate_tie_switches = []
-    seen_tie_keys = set()
-    for l in tie_candidates:
-        ln = l.get("line", "")
-        pair = parse_line_pair(ln)
-        if pair is None or ln in seen_tie_keys:
-            continue
-        seen_tie_keys.add(ln)
-        an, bn = pair
-        a_live = an in reachable_nums
-        b_live = bn in reachable_nums
-        if a_live != b_live:
-            candidate_tie_switches.append({
-                "line": ln,
-                "from": an, "to": bn,
-                "status": l.get("status", 0),
-                "current_a": l.get("current_a", 0),
-                "power_kw": l.get("power_kw", 0),
-                "reason": "该联络线连接带电区域与停电区域，可作为转供候选",
-            })
 
-    # ---- 负荷 ----
-    current_total_load_kw = round(sum(n.get("load_kw", 0) for n in nodes), 2)
-    affected_load_kw = round(sum(
-        node_map.get(nid, {}).get("load_kw", 0) for nid in outage_nums
-    ), 2)
+@app.post("/api/boundary/analyze-realtime")
+def boundary_analyze_realtime(req: BoundaryAnalyzeRealtimeRequest):
+    """边界判定统一接口（扩展 action=scan/evaluate）
 
-    # ---- 潮流摘要 ----
-    voltages = [n.get("voltage_pu", 1.0) for n in nodes]
-    min_v = min(voltages) if voltages else 0
-    max_v = max(voltages) if voltages else 0
-    min_v_node = nodes[voltages.index(min_v)].get("node", 0) if voltages else 0
-    max_v_node = nodes[voltages.index(max_v)].get("node", 0) if voltages else 0
+    action=scan: 仅返回实时风险筛查节点 + 关联线路，不调边界算法
+    action=evaluate: 使用 fault_line 或 selected_related_line 执行边界判定
+    """
+    data = realtime_module._latest_data
+    if data is None or not data.get("nodes"):
+        return {"success": False, "has_data": False,
+                "message": "暂无实时数据，请先接入Simulink数据",
+                "warnings": ["暂无实时数据，请先接入Simulink数据"]}
 
-    max_current, max_current_line = 0.0, ""
-    max_power, max_power_line = 0.0, ""
-    for l in lines_data:
-        ca = abs(l.get("current_a", 0) or 0)
-        pk = abs(l.get("power_kw", 0) or 0)
-        if ca > max_current:
-            max_current, max_current_line = ca, l.get("line", "")
-        if pk > max_power:
-            max_power, max_power_line = pk, l.get("line", "")
+    nodes = data.get("nodes", [])
+    lines_data = data.get("lines", [])
+    trusted = realtime_module._latest_trusted or False
+    ts_str = realtime_module._last_update or ""
+    ti = compute_time_index(ts_str)
+    warnings = []
+    if not trusted:
+        warnings.append("当前数据源未验证，结果需人工复核")
 
-    power_flow_summary = {
-        "min_voltage_pu": round(min_v, 4),
-        "min_voltage_node": min_v_node,
-        "max_voltage_pu": round(max_v, 4),
-        "max_voltage_node": max_v_node,
-        "max_current_a": round(max_current, 2),
-        "max_current_line": max_current_line,
-        "max_power_kw": round(max_power, 2),
-        "max_power_line": max_power_line,
-        "total_load_kw": current_total_load_kw,
-        "affected_load_kw": affected_load_kw,
+    # ====== 实时风险筛查（scan 和 evaluate 均执行） ======
+    risk_nodes = _evaluate_realtime_risk(nodes, lines_data)
+    high_nodes = [r for r in risk_nodes if r["risk_level"] == "high"]
+    medium_nodes = [r for r in risk_nodes if r["risk_level"] == "medium"]
+    low_nodes = [r for r in risk_nodes if r["risk_level"] == "low"]
+    risk_summary = {
+        "high_count": len(high_nodes),
+        "medium_count": len(medium_nodes),
+        "low_count": len(low_nodes),
+        "total_count": len(risk_nodes),
+    }
+    snapshot_meta = {
+        "timestamp": ts_str,
+        "time_index": ti,
+        "trusted_source": trusted,
+        "node_count": len(nodes),
     }
 
-    # ---- 失电节点详情 ----
-    details = []
-    for nid in outage_nums:
-        n = node_map.get(nid, {})
-        details.append({
-            "node": nid,
-            "load_kw": n.get("load_kw", 0),
-            "voltage_pu": n.get("voltage_pu", 0),
-            "pv_kw": n.get("pv_kw", 0),
-            "ev_kw": n.get("ev_kw", 0),
-            "risk_level": n.get("risk_level", "low"),
-        })
+    # ====== action=scan: 仅返回风险筛查 ======
+    if req.action == "scan":
+        return {
+            "success": True,
+            "action": "scan",
+            "source": "realtime",
+            "snapshot_meta": snapshot_meta,
+            "risk_summary": risk_summary,
+            "risk_nodes": risk_nodes,
+            "selected_scenario": None,
+            "boundary_result": None,
+            "can_enter_transfer": False,
+            "warnings": warnings,
+        }
+
+    # ====== action=evaluate: 执行边界判定 ======
+    selected_line = req.selected_related_line or req.fault_line
+    if not selected_line:
+        return {"success": False, "message": "evaluate 模式需提供 fault_line 或 selected_related_line"}
+
+    fault_str = str(selected_line).strip()
+    if parse_line_pair(fault_str) is None:
+        return {"success": False, "message": f"线路格式非法: {fault_str}，需为数字-数字"}
+    fault_key = normalize_line_key(fault_str)
+
+    # ---- 记录用户选择的场景 ----
+    selected_scenario = {
+        "scenario_id": f"RISK-{datetime.now().strftime('%Y%m%d')}-{req.selected_risk_node or 'DIRECT'}",
+        "scenario_type": "preventive_transfer" if req.selected_risk_node else "direct_fault",
+        "source_node": req.selected_risk_node,
+        "analysis_line": fault_key,
+        "risk_source": req.risk_source,
+    }
+
+    # ---- IEEE33 算法服务桥接：边界判定 ----
+    from app.services.ieee33_algorithm_client import boundaryAnalyze as algo_boundary
+    algo_result = algo_boundary({
+        "request_id": f"bnd_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+        "fault_line": fault_key,
+        "timestamp": ts_str,
+    })
+    boundary_result = None
+    can_enter_transfer = False
+    if algo_result.available and algo_result.ok:
+        ext = algo_result.data
+        bnd = ext.get("boundary") or {}
+        energized = (bnd.get("energized_boundary_nodes") or bnd.get("energized_boundary_buses") or [])
+        outage_b = (bnd.get("outage_boundary_nodes") or bnd.get("dead_boundary_buses") or
+                     bnd.get("outage_boundary_buses") or [])
+        b_nodes = ext.get("boundary_nodes") or bnd.get("boundary_nodes") or []
+        if not b_nodes and (energized or outage_b):
+            b_nodes = []
+            for eb in (energized if isinstance(energized, list) else []):
+                b_nodes.append({"energized_bus": eb, "side": "energized"})
+            for ob in (outage_b if isinstance(outage_b, list) else []):
+                existing = [n for n in b_nodes if n.get("outage_bus") == ob]
+                if existing:
+                    existing[0]["outage_bus"] = ob
+                else:
+                    b_nodes.append({"outage_bus": ob, "side": "outage"})
+        crossing = ext.get("crossing_ties") or bnd.get("crossing_ties") or []
+        boundary_result = {
+            "algorithm_source": "external",
+            "fault_line": fault_key,
+            "boundary": bnd,
+            "energized_boundary_nodes": energized,
+            "outage_boundary_nodes": outage_b,
+            "boundary_nodes": b_nodes,
+            "crossing_ties": crossing,
+            "diagnostics": {**algo_result.to_dict(), "algorithm_source": "external"},
+        }
+        can_enter_transfer = len(crossing) > 0
+        warnings.append(algo_result.warning) if algo_result.warning else None
+    elif not algo_result.available and algo_result.error != "not_configured":
+        warnings.append("外部边界判定算法服务暂不可用，结果需人工复核")
+    else:
+        # 本地拓扑兜底
+        warnings.append("外部边界判定算法服务暂不可用，已使用本地拓扑算法兜底")
+        b_nodes, b_lines, crossing = [], [], []
+        try:
+            adj = {}; all_pairs = set()
+            for l in lines_data:
+                ln = l.get("line", ""); st = l.get("status", 1)
+                pair = parse_line_pair(ln)
+                if pair is None: continue
+                key = f"{pair[0]}-{pair[1]}"
+                all_pairs.add(pair)
+                if key == fault_key: continue
+                if st == 1:
+                    aid, bid = f"BUS-{pair[0]:02d}", f"BUS-{pair[1]:02d}"
+                    adj.setdefault(aid, []).append(bid); adj.setdefault(bid, []).append(aid)
+            visited = set(); q = ["BUS-01"]
+            while q:
+                u = q.pop(0)
+                if u in visited: continue
+                visited.add(u)
+                for v in adj.get(u, []):
+                    if v not in visited: q.append(v)
+            reachable = {int(x.replace("BUS-", "")) for x in visited}
+            for l in lines_data:
+                ln = l.get("line", ""); pair = parse_line_pair(ln)
+                if pair is None: continue
+                a, b = pair
+                if (a in reachable) != (b in reachable):
+                    b_nodes.append({"energized_bus": a if a in reachable else b,
+                                    "outage_bus": b if a in reachable else a})
+                    b_lines.append({"line": f"{a}-{b}",
+                                    "source_side": a if a in reachable else b,
+                                    "outage_side": b if a in reachable else a})
+                if l.get("status", 1) == 0:
+                    key = f"{a}-{b}"
+                    if (a in reachable) != (b in reachable):
+                        crossing.append({"line": key, "from": a, "to": b, "status": 0})
+        except Exception:
+            pass
+        boundary_result = {
+            "algorithm_source": "local_fallback",
+            "fault_line": fault_key,
+            "boundary_nodes": b_nodes,
+            "crossing_ties": crossing,
+        }
+        can_enter_transfer = len(crossing) > 0
 
     return {
         "success": True,
-        "has_data": True,
+        "action": "evaluate",
         "source": "realtime",
-        "source_tag": src_tag,
-        "trusted_source": trusted,
-        "timestamp": data.get("timestamp", ""),
-        "message": "基于实时拓扑完成故障分析",
-        "fault_line": fault_key,
-        "source_node": 1,
-        "reachable_nodes": reachable_nums,
-        "outage_nodes": outage_nums,
-        "boundary_nodes": boundary_nodes,
-        "boundary_edges": boundary_edges,
-        "candidate_tie_switches": candidate_tie_switches,
-        "current_total_load_kW": current_total_load_kw,
-        "affected_load_kW": affected_load_kw,
-        "affected_count": len(outage_nums),
-        "reachable_count": len(reachable_nums),
-        "powered_nodes": reachable_nums,
-        "affected_node_details": details,
-        "power_flow_summary": power_flow_summary,
+        "snapshot_meta": snapshot_meta,
+        "risk_summary": risk_summary,
+        "risk_nodes": risk_nodes,
+        "selected_scenario": selected_scenario,
+        "boundary_result": boundary_result,
+        "can_enter_transfer": can_enter_transfer,
         "warnings": warnings,
+    }
+
+
+@app.post("/api/transfer/recommend-realtime")
+def transfer_recommend_realtime(req: TransferRecommendRealtimeRequest):
+    """转供决策统一接口：外部算法优先，不可用时返回本地拓扑候选（非评分推荐）"""
+    data = realtime_module._latest_data
+    if data is None or not data.get("nodes"):
+        return {"success": False, "has_data": False,
+                "message": "暂无实时数据，请先接入Simulink数据",
+                "warnings": ["暂无实时数据，请先接入Simulink数据"]}
+
+    nodes = data.get("nodes", [])
+    lines_data = data.get("lines", [])
+    fault_str = req.fault_line.strip()
+    if parse_line_pair(fault_str) is None:
+        return {"success": False, "message": f"故障线路格式非法: {fault_str}，需为数字-数字"}
+    fault_key = normalize_line_key(fault_str)
+    outage_nums = list(req.outage_nodes or [])
+    boundary_nums = list(req.boundary_nodes or [])
+    trusted = realtime_module._latest_trusted or False
+
+    warnings = []
+    if not trusted:
+        warnings.append("当前数据源未验证，结果需人工复核")
+
+    # ---- IEEE33 算法服务桥接：pipeline/evaluate（异步任务）----
+    from app.services.ieee33_algorithm_client import submitPipelineEvaluate as algo_pipeline
+    ti = compute_time_index(realtime_module._last_update or "")
+    pipeline_payload = {
+        "request_id": f"tr_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+        "fault_line": fault_key,
+        "outage_nodes": outage_nums,
+        "timestamp": realtime_module._last_update or "",
+        "time_index": ti,
+        "evaluation_mode": "auto",
+        "allow_nearest_library_time": True,
+        "max_ties": 2,
+        "snapshot": {
+            "timestamp": realtime_module._last_update or "",
+            "time_index": ti,
+            "nodes": nodes, "lines": lines_data,
+            "switches": data.get("switches", {}),
+        },
+    }
+    algo_result = algo_pipeline(pipeline_payload)
+    if algo_result.available and algo_result.ok:
+        ext = algo_result.data
+        # 标准化候选方案
+        cands = (ext.get("candidate_tie_switches") or ext.get("candidate_plans") or
+                 ext.get("candidates") or [])
+        cand_plans = ext.get("candidate_plans") or cands
+        # 推荐方案：有完整对象直接用；只有 plan_id 则从 candidate_plans 中查找
+        rec = ext.get("recommended_plan") or None
+        rec_id = ext.get("recommended_plan_id") or (rec.get("plan_id") if isinstance(rec, dict) else None)
+        if not isinstance(rec, dict) and rec_id and isinstance(cand_plans, list):
+            for cp in cand_plans:
+                if str(cp.get("plan_id") or cp.get("id") or "") == str(rec_id):
+                    rec = cp
+                    break
+        # switching_plan 补全：如果候选方案有 tie_lines 但没有 switching_plan，临时生成
+        for cp in (cand_plans if isinstance(cand_plans, list) else []):
+            if not cp.get("switching_plan") and cp.get("tie_lines"):
+                cp["switching_plan"] = {
+                    "open_lines": [fault_key],
+                    "close_lines": cp["tie_lines"],
+                }
+                warnings.append("算法服务未显式返回 switching_plan，业务后端根据 fault_line 和 tie_lines 生成临时 switching_plan，需复核")
+        if isinstance(cands, list) and cands:
+            return {
+                "success": True, "has_data": True,
+                "algorithm_source": "external",
+                "fault_analysis": ext.get("fault_analysis") or {},
+                "boundary": ext.get("boundary") or {},
+                "candidate_tie_switches": cands,
+                "candidate_plans": cand_plans,
+                "recommended_plan": rec,
+                "recommended_plan_id": rec_id,
+                "fault_line": fault_key,
+                "outage_nodes": outage_nums,
+                "diagnostics": {**algo_result.to_dict(), "algorithm_source": "external"},
+                "warnings": warnings + ([algo_result.warning] if algo_result.warning else []),
+            }
+
+    if not algo_result.available and algo_result.error != "not_configured":
+        from app.services.ieee33_algorithm_client import ALGO_JOB_TIMEOUT_MS as _jt_ms
+        job_id = algo_result.data.get("job_id") or ""
+        if algo_result.error in ("job_timeout", "job_status_fetch_failed") and job_id:
+            # pipeline 已提交但轮询超时 → pending，保留 job_id 供后续查询
+            return {
+                "success": True, "has_data": True,
+                "algorithm_source": "external_pending",
+                "status": "pending",
+                "job_id": job_id,
+                "fault_line": fault_key, "outage_nodes": outage_nums,
+                "candidate_tie_switches": [], "candidate_plans": [],
+                "recommended_plan": None, "recommended_plan_id": None,
+                "switching_plan": None,
+                "diagnostics": {**algo_result.to_dict(), "algorithm_source": "external_pending"},
+                "warnings": warnings + [
+                    "转供决策任务仍在计算中，请稍后继续查询",
+                    f"可调用 GET /api/transfer/jobs/{job_id} 查询任务状态",
+                    f"可调用 GET /api/transfer/jobs/{job_id}/result 获取结果",
+                    "结果需人工复核",
+                ],
+            }
+        # job_failed / timeout (无 job_id) / connection_error → 降级本地拓扑候选
+        w = warnings + ["外部转供决策算法服务暂不可用，未生成可信推荐方案"]
+        if job_id:
+            w.append(f"已提交任务 job_id={job_id}，但执行失败，已降级为本地规则评估")
+        else:
+            w.append("算法服务不可用，已降级为本地规则评估")
+        # 不立即返回，继续执行下面的本地拓扑候选兜底
+        warnings = w
+
+    # ---- 本地拓扑候选兜底（仅标注 topology_candidate，不是推荐方案）----
+    topology_cands = []
+    try:
+        adj = {}; all_pairs = set()
+        for l in lines_data:
+            ln = l.get("line", ""); st = l.get("status", 1)
+            pair = parse_line_pair(ln)
+            if pair is None: continue
+            key = f"{pair[0]}-{pair[1]}"
+            all_pairs.add(pair)
+            if key == fault_key: continue
+            if st == 1:
+                aid, bid = f"BUS-{pair[0]:02d}", f"BUS-{pair[1]:02d}"
+                adj.setdefault(aid, []).append(bid); adj.setdefault(bid, []).append(aid)
+        visited = set(); q = ["BUS-01"]
+        while q:
+            u = q.pop(0)
+            if u in visited: continue
+            visited.add(u)
+            for v in adj.get(u, []):
+                if v not in visited: q.append(v)
+        reachable = {int(x.replace("BUS-", "")) for x in visited}
+        outage_set = set(outage_nums)
+        for l in lines_data:
+            ln = l.get("line", "")
+            pair = parse_line_pair(ln)
+            if pair is None: continue
+            key = f"{pair[0]}-{pair[1]}"
+            if key == fault_key: continue
+            if l.get("status", 1) == 0:
+                a_live = pair[0] in reachable
+                b_live = pair[1] in reachable
+                if a_live != b_live:
+                    topology_cands.append({
+                        "line": key,
+                        "from": pair[0], "to": pair[1],
+                        "status": 0,
+                        "type": "topology_candidate",
+                        "caveat": "仅为拓扑候选，不是评分推荐方案；请使用 evaluate-realtime 获取完整评分",
+                    })
+    except Exception:
+        pass
+
+    return {
+        "success": True, "has_data": True,
+        "algorithm_source": "local_fallback",
+        "fault_line": fault_key, "outage_nodes": outage_nums, "boundary_nodes": boundary_nums,
+        "candidate_tie_switches": topology_cands,
+        "recommended_plan": None,
+        "switching_plan": None,
+        "message": "本地拓扑候选兜底（仅为拓扑候选，外部转供决策算法未配置；请使用 evaluate-realtime 获取完整评分推荐）",
+        "diagnostics": {"algorithm_source": "local_fallback", "candidate_type": "topology_only"},
+        "warnings": warnings,
+    }
+
+
+# ==================== 算法任务状态查询（包装外部 /api/v1/jobs，不暴露 Key）====================
+
+@app.get("/api/transfer/jobs/{job_id}")
+def transfer_job_status(job_id: str):
+    """查询转供决策异步任务状态（包装 GET /api/v1/jobs/{job_id}）"""
+    from app.services.ieee33_algorithm_client import getJob
+    # 已完成状态列表（外部服务可能使用不同命名）
+    COMPLETED_STATES = ("completed", "done", "success", "succeeded")
+    r = getJob(job_id)
+    if r.ok:
+        raw_state = (r.data.get("status") or r.data.get("state") or "unknown").lower()
+        # 归一化：succeeded → completed
+        normalized = "completed" if raw_state in COMPLETED_STATES else raw_state
+        return {
+            "success": True,
+            "algorithm_source": "external",
+            "job_id": job_id,
+            "status": normalized,
+            "data": r.data,
+            "warnings": [r.warning] if r.warning else [],
+        }
+    return {
+        "success": False,
+        "algorithm_source": "external_unavailable",
+        "job_id": job_id,
+        "status": "unknown",
+        "diagnostics": r.to_dict(),
+        "warnings": ["无法查询算法任务状态，服务不可用或未配置", "结果需人工复核"],
+    }
+
+
+@app.get("/api/transfer/jobs/{job_id}/result")
+def transfer_job_result(job_id: str):
+    """查询转供决策异步任务结果（包装 GET /api/v1/jobs/{job_id}/result）
+
+    修正逻辑：
+    - 识别 succeeded 为 completed
+    - 提取 candidate_scores → 按 tie_lines 映射到 candidate_plans 形成 scored_plans
+    - HTTP 200 但 body.success=false → status=failed
+    """
+    from app.services.ieee33_algorithm_client import getJob, getJobResult
+    COMPLETED_STATES = ("completed", "done", "success", "succeeded")
+    # 先查状态
+    status_r = getJob(job_id)
+    if status_r.ok:
+        state = (status_r.data.get("status") or status_r.data.get("state") or "").lower()
+        if state not in COMPLETED_STATES:
+            return {
+                "success": True,
+                "algorithm_source": "external_pending",
+                "job_id": job_id,
+                "status": "pending",
+                "job_state": state,
+                "result_available": False,
+                "candidate_tie_switches": None, "candidate_plans": None,
+                "recommended_plan": None, "recommended_plan_id": None,
+                "switching_plan": None,
+                "warnings": ["转供决策任务仍在计算中，请稍后继续查询"],
+            }
+    # 查询结果
+    result_r = getJobResult(job_id)
+    if result_r.ok:
+        ext = result_r.data
+        ext_success = ext.get("success")
+        ext_error = ext.get("error") or ""
+        if ext_success is False:
+            error_type = "matpower_failed" if ("matpower" in ext_error.lower() or "exit" in ext_error.lower()) else "job_failed"
+            return {
+                "success": False,
+                "algorithm_source": "external_unavailable",
+                "job_id": job_id,
+                "status": "failed",
+                "error_type": error_type,
+                "error_message": ext_error,
+                "candidate_plans": None,
+                "recommended_plan": None, "recommended_plan_id": None,
+                "warnings": [
+                    "外部潮流评分失败：" + ext_error,
+                    "当前仅展示候选方案/规则版预评估，需人工复核",
+                ],
+            }
+        # ====== 成功：提取 candidate_scores 并映射到 candidate_plans ======
+        candidate_plans = ext.get("candidate_plans") or []
+        candidate_scores = ext.get("candidate_scores") or []
+        ext_recommended_id = ext.get("recommended_plan_id") or ""
+
+        # 构建 tie_lines → plan_id 的查表（候选方案）
+        candidate_by_tie = {}
+        for cp in candidate_plans:
+            if not isinstance(cp, dict): continue
+            tls = cp.get("tie_lines") or []
+            key = frozenset(tls)
+            if key: candidate_by_tie[key] = cp.get("plan_id") or cp.get("algorithm_plan_id") or ""
+
+        # 将 candidate_scores 转换为 scored_plans，同时做 plan_id 映射
+        scored_plans = []
+        mapped_recommended_id = ""
+        for cs in candidate_scores:
+            if not isinstance(cs, dict): continue
+            tls = cs.get("tie_lines") or []
+            score_id = cs.get("plan_id") or ""
+            # 按 tie_lines 匹配候选方案
+            matched_cand_id = candidate_by_tie.get(frozenset(tls)) or ""
+            # 降级：按编号后缀匹配 (ALG-SCORE-001 → ALG-001)
+            if not matched_cand_id and score_id:
+                import re
+                m = re.search(r'(\d+)$', str(score_id))
+                if m:
+                    suffix = m.group(1)
+                    for cp in candidate_plans:
+                        cid = cp.get("plan_id") or ""
+                        if cid.endswith(suffix) and "SCORE" not in str(cid):
+                            matched_cand_id = cid
+                            break
+            mapped_id = matched_cand_id or score_id
+            # 映射 recommended_plan_id
+            if ext_recommended_id and score_id == ext_recommended_id:
+                mapped_recommended_id = mapped_id
+            # 提取评分指标
+            pf = cs.get("power_flow") or {}
+            sb = cs.get("score_breakdown") or {}
+            scored_plans.append({
+                "plan_id": mapped_id,
+                "source_score_id": score_id,
+                "score": cs.get("score"),
+                "rank": cs.get("rank"),
+                "score_source": "external_powerflow",
+                "external_score_used": True,
+                "power_flow": {
+                    "converged": pf.get("converged"),
+                    "min_voltage_pu": pf.get("min_voltage_pu"),
+                    "max_loading_pct": pf.get("max_loading_pct"),
+                    "loss_kw": pf.get("loss_kw"),
+                },
+                "score_breakdown": {
+                    "recovery_score": round((sb.get("restoration_rate") or {}).get("total_weight", 0) * 50, 1) if sb.get("restoration_rate") else None,
+                    "voltage_score": round((sb.get("voltage_quality") or {}).get("weight", 0) * 100, 1) if sb.get("voltage_quality") else None,
+                    "loading_score": round((sb.get("line_loading") or {}).get("weight", 0) * 100, 1) if sb.get("line_loading") else None,
+                    "loss_score": round((sb.get("loss") or {}).get("weight", 0) * 100, 1) if sb.get("loss") else None,
+                    "operation_score": round((sb.get("operation_complexity") or {}).get("weight", 0) * 100, 1) if sb.get("operation_complexity") else None,
+                    "total_score": cs.get("score"),
+                    "total_max": 100,
+                },
+                "min_restored_voltage_pu": pf.get("min_voltage_pu"),
+                "voltage_ok": pf.get("min_voltage_pu") is not None and pf.get("min_voltage_pu", 0) >= 0.95,
+                "tie_loading_pct": pf.get("max_loading_pct"),
+                "overloaded": pf.get("max_loading_pct") is not None and pf.get("max_loading_pct", 0) > 100.0,
+                "is_usable": True,
+                "violations": cs.get("violations") or [],
+                "warnings": cs.get("warnings") or [],
+            })
+        # 如果 scored_plans 未通过 tie_lines 匹配到，也保留原始 candidate_plans 中已匹配的
+        return {
+            "success": True,
+            "algorithm_source": "external",
+            "job_id": job_id,
+            "status": "completed",
+            "score_source": "external_powerflow",
+            "result_available": True,
+            "candidate_tie_switches": ext.get("candidate_tie_switches") or ext.get("candidates") or [],
+            "candidate_plans": candidate_plans,
+            "scored_plans": scored_plans,
+            "recommended_plan_id": mapped_recommended_id or ext_recommended_id,
+            "warnings": (ext.get("warnings") or []) + ([result_r.warning] if result_r.warning else []),
+        }
+    # HTTP 非 200
+    diag = result_r.to_dict()
+    err = diag.get("error") or ""
+    if err == "timeout":
+        return {
+            "success": False,
+            "algorithm_source": "external_unavailable",
+            "job_id": job_id,
+            "status": "timeout",
+            "error_type": "timeout",
+            "candidate_plans": None,
+            "warnings": ["外部算法服务响应超时，评分结果未就绪，需人工复核"],
+        }
+    if err == "connection_error":
+        return {
+            "success": False,
+            "algorithm_source": "external_unavailable",
+            "job_id": job_id,
+            "status": "failed",
+            "error_type": "connection_error",
+            "candidate_plans": None,
+            "warnings": ["外部算法服务暂不可用，无法获取评分结果，需人工复核"],
+        }
+    return {
+        "success": False,
+        "algorithm_source": "external_unavailable",
+        "job_id": job_id,
+        "status": "unknown",
+        "diagnostics": diag,
+        "warnings": ["无法获取算法任务结果，服务不可用或任务未完成", "结果需人工复核"],
     }
 
 
@@ -758,6 +1455,77 @@ def transfer_evaluate_realtime(req: TransferEvaluateRealtimeRequest):
             for j in range(i + 1, len(candidates)):
                 plans.append(evaluate_plan([candidates[i], candidates[j]]))
 
+    # ---- 外部算法桥接：优先调用 candidates/generate → 过滤 → 评分 ----
+    # 安全初始化，防止 diagnostics 合并时引用未定义变量
+    from app.services.ieee33_algorithm_client import candidatesGenerate as algo_candidates, AlgoResult as IeeeAlgoResult
+    algo_transfer_result = IeeeAlgoResult(available=False, error="not_configured")
+    algo_transfer_result = algo_candidates({
+        "request_id": f"ev_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+        "fault_line": fault_key,
+        "timestamp": realtime_module._last_update or "",
+    }, timeout_ms=5000)
+    ext_candidates_source = "local_rule"
+    if algo_transfer_result.available and algo_transfer_result.ok:
+        algo_data = algo_transfer_result.data
+        raw_cands = algo_data.get("candidates") or algo_data.get("candidate_plans") or []
+        if isinstance(raw_cands, list) and raw_cands:
+            feasible = []; rejected = []
+            for rc in raw_cands:
+                if not isinstance(rc, dict): continue
+                pid = str(rc.get("plan_id") or rc.get("algorithm_plan_id") or "").strip()
+                tids = rc.get("tie_ids") or rc.get("tie_branch_indices") or []
+                tlines = rc.get("tie_lines") or []
+                restored = rc.get("restored_buses") or rc.get("restored_nodes") or []
+                topo_ok = rc.get("topology_feasible")
+                radial_ok = rc.get("radial")
+                cycle = rc.get("cycle_count")
+                is_ok = (topo_ok is True and radial_ok is True and cycle == 0)
+                item = {
+                    "plan_id": pid,
+                    "tie_ids": tids if isinstance(tids, list) else [tids],
+                    "tie_lines": tlines if isinstance(tlines, list) else [tlines],
+                    "restored_nodes": restored if isinstance(restored, list) else [restored],
+                    "topology_feasible": topo_ok, "radial": radial_ok, "cycle_count": cycle,
+                    "is_feasible": is_ok,
+                    "source": "external_candidates",
+                    "score_source": "external_candidates",
+                }
+                if is_ok:
+                    feasible.append(item)
+                else:
+                    item["reject_reason"] = "形成环网，不满足辐射状运行约束" if not radial_ok and cycle > 0 else "拓扑不可行"
+                    rejected.append(item)
+            if feasible:
+                ext_candidates_source = "external_candidates"
+                # 将可行外部候选方案归一化为 candidate_scores 写入缓存，供下方合并逻辑处理
+                norm_scores = []
+                for item in feasible:
+                    norm_scores.append({
+                        "plan_id": item["plan_id"],
+                        "tie_lines": item["tie_lines"],
+                        "tie_ids": item["tie_ids"],
+                        "score_source": "external_candidates",
+                        "is_feasible": True,
+                    })
+                global _external_score_result
+                _external_score_result = {
+                    "fault_line": fault_key,
+                    "timestamp": algo_data.get("timestamp") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "algorithm": algo_data.get("algorithm") or "external_algo",
+                    "algorithm_version": algo_data.get("algorithm_version") or "",
+                    "candidate_scores": norm_scores,
+                    "feasible_candidates": feasible,
+                    "rejected_candidates": rejected,
+                    "received_at": datetime.now(),
+                }
+            # 外部候选结果写入 warnings
+            if not feasible:
+                warnings.append("外部候选方案接口返回了候选方案，但均不满足拓扑可行性条件")
+        else:
+            warnings.append("外部候选方案接口返回为空，使用本地规则版预评估")
+    else:
+        warnings.append("外部候选方案接口暂不可用，当前使用规则版预评估")
+
     # ---- 合并外部高级评分（MATPOWER 等）----
     # 条件：缓存存在 + fault_line 归一化一致 + 未过期（5分钟）；按 plan_id 或 tie_lines 集合匹配
     ext = _external_score_result
@@ -867,13 +1635,17 @@ def transfer_evaluate_realtime(req: TransferEvaluateRealtimeRequest):
         "total_plans": len(plans),
         "static_tie_fallback_used": static_tie_fallback_used,
         "recommended_plan": recommended,
-        "plans": returned_plans,  # 最多 10 个 + 必含推荐方案
+        "plans": returned_plans,
+        "external_feasible_candidates": (_external_score_result or {}).get("feasible_candidates") if ext_candidates_source == "external_candidates" else None,
+        "external_rejected_candidates": (_external_score_result or {}).get("rejected_candidates") if ext_candidates_source == "external_candidates" else None,
         "diagnostics": {
             "external_score_available": ext_available,
             "external_score_used_count": ext_used_count,
             "external_score_algorithm": ext_algo,
             "external_score_timestamp": ext_ts,
             "score_mode": "external_matpower" if ext_used_count > 0 else "local_rule",
+            "candidates_source": ext_candidates_source,
+            **algo_transfer_result.to_dict(),
         },
         "warnings": warnings,
     }
@@ -912,6 +1684,114 @@ def dashboard_summary():
             "data_source": realtime_module._latest_source or "none",
             "trusted_source": realtime_module._latest_trusted,
         },
+    }
+
+
+# ==================== 安全校验统一接口（外部算法适配层）====================
+
+@app.post("/api/safety/validate-realtime")
+def safety_validate_realtime(req: SafetyValidateRealtimeRequest):
+    """安全校验/潮流校验统一接口：外部算法优先，不可用时严格拒绝生成正式操作票"""
+    data = realtime_module._latest_data
+    if data is None or not data.get("nodes"):
+        return {
+            "success": False, "has_data": False,
+            "message": "暂无实时数据，请先接入Simulink数据",
+            "warnings": ["暂无实时数据，请先接入Simulink数据"],
+        }
+
+    nodes = data.get("nodes", [])
+    lines_data = data.get("lines", [])
+    fault_str = req.fault_line.strip()
+    if parse_line_pair(fault_str) is None:
+        return {"success": False, "message": f"故障线路格式非法: {fault_str}，需为数字-数字"}
+    fault_key = normalize_line_key(fault_str)
+    tie_switch = normalize_line_key(req.candidate_tie_switch) if req.candidate_tie_switch else ""
+    switching_plan = list(req.switching_plan or [])
+    trusted = realtime_module._latest_trusted or False
+
+    warnings = []
+    if not trusted:
+        warnings.append("当前数据源未验证，结果需人工复核")
+
+    # ---- 构造 switching_plan：支持完整对象 / candidate_tie_switch 自动生成 ----
+    switching_plan = (req.switching_plan or {})
+    if isinstance(switching_plan, list):
+        switching_plan = {"open_lines": [], "close_lines": []}
+    if not isinstance(switching_plan, dict) or (not switching_plan.get("open_lines") and not switching_plan.get("close_lines")):
+        tie_str = str(req.candidate_tie_switch or "").strip()
+        if tie_str and parse_line_pair(tie_str):
+            switching_plan = {
+                "open_lines": [fault_key],
+                "close_lines": [normalize_line_key(tie_str)],
+            }
+        elif not switching_plan:
+            return {"success": False, "has_data": True,
+                    "message": "缺少 switching_plan 或 candidate_tie_switch，请传入转供操作方案",
+                    "warnings": warnings}
+
+    limits = {"min_voltage_pu": 0.95, "max_voltage_pu": 1.05, "max_loading_pct": 100.0}
+    if isinstance(req.switching_plan, dict) and req.switching_plan.get("limits"):
+        limits.update(req.switching_plan["limits"])
+
+    # ---- IEEE33 算法服务桥接：安全/潮流校验 ----
+    from app.services.ieee33_algorithm_client import safetyValidate as algo_safety
+    ti = compute_time_index(realtime_module._last_update or "")
+    algo_result = algo_safety({
+        "request_id": f"safety_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+        "timestamp": realtime_module._last_update or "",
+        "time_index": ti,
+        "snapshot": {
+            "timestamp": realtime_module._last_update or "",
+            "time_index": ti,
+            "nodes": nodes, "lines": lines_data, "switches": data.get("switches", {}),
+        },
+        "switching_plan": switching_plan,
+        "limits": limits,
+    })
+    if algo_result.available and algo_result.ok:
+        ext = algo_result.data
+        conv = ext.get("converged")
+        safe = ext.get("safe")
+        violations = ext.get("violations") or []
+        # 安全只有全部条件满足才能出正式票
+        can_ticket = bool(trusted and conv is True and safe is True and len(violations) == 0)
+        return {
+            "success": True, "has_data": True,
+            "algorithm_source": "external",
+            "converged": conv,
+            "safe": safe,
+            "topology": ext.get("topology") or {},
+            "power_flow": ext.get("power_flow") or {},
+            "nodes": ext.get("nodes") or [],
+            "lines": ext.get("lines") or [],
+            "violations": violations,
+            "electrical_credibility": {
+                "level": "high" if can_ticket else "low",
+                "powerflow_validated": conv is True,
+                "can_generate_formal_ticket": can_ticket,
+            },
+            "diagnostics": {**algo_result.to_dict(), "algorithm_source": "external"},
+            "warnings": warnings + (ext.get("warnings") or []) + ([algo_result.warning] if algo_result.warning else []),
+        }
+
+    # ---- 外部不可用 / 未配置 → 严格拒绝（不返回 502）----
+    return {
+        "success": False, "has_data": True,
+        "algorithm_source": "unavailable",
+        "converged": None, "safe": None,
+        "message": "外部潮流安全校验服务暂不可用，不能生成正式操作票",
+        "electrical_credibility": {
+            "level": "low",
+            "powerflow_validated": False,
+            "can_generate_formal_ticket": False,
+        },
+        "diagnostics": algo_result.to_dict() if algo_result else {},
+        "warnings": warnings + [
+            "安全/潮流校验接口尚未接入",
+            "未完成重构后潮流计算，结果不可用于正式操作票",
+            "结果需人工复核",
+        ],
     }
 
 
@@ -1088,6 +1968,13 @@ def on_startup():
     except Exception as e:
         print(f"警告：数据库连接失败，请检查 MySQL 配置 — {e}")
         print("后端将以只读模式运行，请确保 MySQL 已启动并执行 CREATE DATABASE power_ticket_system")
+
+
+@app.get("/api/algorithm/health")
+def algorithm_health():
+    """算法服务健康检查：代理后端调用 GET /api/v1/health + /api/v1/capabilities"""
+    from app.services.ieee33_algorithm_client import checkAlgorithmHealth
+    return checkAlgorithmHealth()
 
 
 @app.get("/")

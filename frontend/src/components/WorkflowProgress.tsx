@@ -2,7 +2,7 @@
  * 流程进度条 — 显示在业务页面顶部
  * 7 个节点：故障输入→边界判定→转供决策→操作序列→模板成票→安全校验→导出归档
  */
-import { getWorkflowState, getCurrentStepIndex } from '../store/workflowStore';
+import { getCurrentWorkflow, getCurrentStepIndex } from '../store/workflowStore';
 
 const steps = [
   { key: 'fault', label: '故障输入' },
@@ -29,8 +29,7 @@ interface Props {
 }
 
 export default function WorkflowProgress({ currentStep }: Props) {
-  const state = getWorkflowState();
-  const completedUpTo = getCurrentStepIndex(state);
+  const completedUpTo = getCurrentStepIndex();
   const currentIdx = stepIndexMap[currentStep];
 
   return (
