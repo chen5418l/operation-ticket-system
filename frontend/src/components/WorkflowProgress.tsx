@@ -1,6 +1,6 @@
 /**
  * 流程进度条 — 显示在业务页面顶部
- * 7 个节点：故障输入→边界判定→转供决策→操作序列→模板成票→安全校验→导出归档
+ * 7 个节点：故障输入→边界判定→转供决策→操作序列生成→安全校验→模板化成票→导出归档
  */
 import { getCurrentWorkflow, getCurrentStepIndex } from '../store/workflowStore';
 
@@ -8,24 +8,25 @@ const steps = [
   { key: 'fault', label: '故障输入' },
   { key: 'boundary', label: '边界判定' },
   { key: 'transfer', label: '转供决策' },
-  { key: 'sequence', label: '操作序列' },
-  { key: 'ticket', label: '模板成票' },
+  { key: 'sequence', label: '操作序列生成' },
   { key: 'safety', label: '安全校验' },
+  { key: 'ticket', label: '模板化成票' },
   { key: 'archive', label: '导出归档' },
 ];
 
 const stepIndexMap: Record<string, number> = {
+  // 与 getCurrentStepIndex() 返回索引对齐
   'fault': 0,
   'boundary': 1,
   'transfer': 2,
   'sequence': 3,
-  'ticket': 4,
-  'safety': 5,
+  'safety': 4,
+  'ticket': 5,
   'archive': 6,
 };
 
 interface Props {
-  currentStep: 'fault' | 'boundary' | 'transfer' | 'sequence' | 'ticket' | 'safety' | 'archive';
+  currentStep: 'fault' | 'boundary' | 'transfer' | 'sequence' | 'safety' | 'ticket' | 'archive';
 }
 
 export default function WorkflowProgress({ currentStep }: Props) {
@@ -48,7 +49,7 @@ export default function WorkflowProgress({ currentStep }: Props) {
       {steps.map((step, i) => {
         const isCompleted = i < completedUpTo;
         const isCurrent = i === currentIdx;
-        const color = isCompleted ? '#52c41a' : isCurrent ? '#1677ff' : '#d9d9d9';
+        const color = isCompleted ? '#1f8a4c' : isCurrent ? '#2f80ed' : '#d9d9d9';
 
         return (
           <div key={step.key} style={{ display: 'flex', alignItems: 'center', flex: i < 6 ? 1 : undefined, minWidth: 0 }}>
@@ -77,7 +78,7 @@ export default function WorkflowProgress({ currentStep }: Props) {
               </div>
               <span style={{
                 fontSize: 11,
-                color: isCurrent ? '#1677ff' : isCompleted ? '#52c41a' : '#bfbfbf',
+                color: isCurrent ? '#2f80ed' : isCompleted ? '#1f8a4c' : '#bfbfbf',
                 fontWeight: isCurrent ? 600 : 400,
                 whiteSpace: 'nowrap',
               }}>

@@ -1845,7 +1845,32 @@ def external_score_update(req: ExternalScoreUpdateRequest):
     }
 
 
-# ==================== 操作序列生成（基于已确认的转供方案）====================
+# ==================== 操作序列生成（8010 prepare→generate + 本地兜底）====================
+
+# case 注册表（内存，后端重启后丢失，前端可传 sequence 重建）
+_case_registry: dict = {}   # case_id → record
+_case_by_key: dict = {}     # "score_job_id:plan_id:fault_line" → case_id
+
+def _make_case_id() -> str:
+    import uuid
+    return f"CASE-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:12]}"
+
+def _get_or_create_case(score_job_id: str, selected_plan_id: str, fault_line: str,
+                         selected_plan: dict = None, job_id: str = None) -> dict:
+    key = f"{score_job_id}:{selected_plan_id}:{fault_line}"
+    if key in _case_by_key and _case_by_key[key] in _case_registry:
+        return _case_registry[_case_by_key[key]]
+    cid = _make_case_id()
+    rec = {"case_id": cid, "score_job_id": score_job_id, "job_id": job_id or score_job_id,
+           "fault_line": fault_line, "selected_plan_id": selected_plan_id,
+           "selected_plan_json": selected_plan or {}, "sequence_json": None,
+           "safety_report_json": None, "workflow_status": "PLAN_SELECTED",
+           "formal_ticket_authorized": False, "created_at": datetime.now().isoformat(),
+           "updated_at": datetime.now().isoformat(), "version": 1}
+    _case_registry[cid] = rec
+    _case_by_key[key] = cid
+    return rec
+
 
 class SequenceGenerateRequest(BaseModel):
     fault_line: str = ""
@@ -1855,8 +1880,8 @@ class SequenceGenerateRequest(BaseModel):
 @app.post("/api/sequence/generate")
 def sequence_generate(req: SequenceGenerateRequest):
     """
-    根据转供决策页面确认采用的方案生成结构化操作序列。
-    不依赖外部 5000 Flask 服务，不使用静态演示方案。
+    [DEPRECATED] 请使用 /api/operation-sequence/generate（8010 prepare→generate 链路）。
+    本端点仅保留本地规则兜底，将在后续版本移除。
     """
     plan = req.selected_plan
     if not plan:
@@ -1957,6 +1982,236 @@ def sequence_generate(req: SequenceGenerateRequest):
         "operation_steps": steps,
         "warnings": warnings,
     }
+
+
+# ==================== 8010 操作序列生成（prepare→generate 链路）====================
+
+def _build_local_operation_sequence(fault_line: str, plan: dict) -> dict:
+    """本地规则版操作序列生成（8010 不可用时降级使用）"""
+    fault_key = normalize_line_key(fault_line)
+    tie_keys = plan.get("tie_lines") or [s for s in str(plan.get("tie_switch", "")).split("+") if s.strip()]
+    tie_keys = [normalize_line_key(k) for k in tie_keys if parse_line_pair(k) is not None]
+    tie_keys = list(dict.fromkeys(tie_keys))
+    if not tie_keys:
+        return {"operation_steps": [], "operation_count": 0, "error": "方案中未包含有效联络线"}
+    steps = []
+    n = 1
+    steps.append({"step": n, "operation_type": "verify_open", "line": fault_key,
+                  "action": f"确认故障线路 {fault_key} 已隔离（两侧开关处于断开位置）"}); n += 1
+    for tk in tie_keys:
+        steps.append({"step": n, "operation_type": "close", "line": tk,
+                      "action": f"合上联络开关 {tk}，恢复供电"}); n += 1
+    steps.append({"step": n, "operation_type": "check", "line": "",
+                  "action": "核查恢复区电压≥0.95pu、线路负载不超限"}); n += 1
+    return {"operation_steps": steps, "operation_count": len(steps), "source": "local_fallback"}
+
+
+@app.post("/api/operation-sequence/generate")
+def operation_sequence_generate(req: dict = None):
+    """8010 prepare→generate 操作序列生成。
+    前端传入 score_job_id、selected_plan_id、fault_line、selected_plan。
+    后端调 8010 prepare → generate，失败时降级本地规则。
+    """
+    from app.services.ieee33_algorithm_client import prepareSequence as algo_prepare, generateSequence as algo_gen
+
+    body = req or {}
+    score_job_id = str(body.get("score_job_id") or body.get("job_id") or "")
+    selected_plan_id = str(body.get("selected_plan_id") or "")
+    fault_line = str(body.get("fault_line") or "")
+    plan_raw = body.get("selected_plan_json") or body.get("selected_plan") or {}
+
+    if not selected_plan_id:
+        return {"success": False, "message": "缺少 selected_plan_id", "case_id": None}
+
+    if not score_job_id:
+        score_job_id = f"auto-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+    rec = _get_or_create_case(score_job_id=score_job_id, selected_plan_id=selected_plan_id,
+                               fault_line=fault_line, selected_plan=plan_raw,
+                               job_id=body.get("job_id") or score_job_id)
+    cid = rec["case_id"]
+
+    # 组装 prepare payload
+    tie_lines_list = plan_raw.get("tie_lines") or [s for s in str(plan_raw.get("tie_switch", "")).split("+") if s.strip()]
+    tie_lines_list = [normalize_line_key(k) for k in tie_lines_list if parse_line_pair(k) is not None]
+
+    # BFS 计算 boundary 数据（8010 prepare 必需）
+    outage_nodes = body.get("outage_nodes") or plan_raw.get("outage_nodes") or []
+    boundary_data = body.get("boundary") or body.get("boundary_result") or {}
+    if not boundary_data or not boundary_data.get("crossing_ties") or not outage_nodes:
+        rt_data = realtime_module._latest_data or {}
+        nodes_raw = rt_data.get("nodes", [])
+        lines_raw = rt_data.get("lines", [])
+        try:
+            adj = {}; all_pairs = set(); crossing = []
+            for l in lines_raw:
+                ln = l.get("line", ""); st = l.get("status", 1)
+                pair = parse_line_pair(ln)
+                if pair is None: continue
+                key = f"{pair[0]}-{pair[1]}"
+                all_pairs.add(pair)
+                if key == fault_line: continue
+                if st == 1:
+                    aid, bid = f"BUS-{pair[0]:02d}", f"BUS-{pair[1]:02d}"
+                    adj.setdefault(aid, []).append(bid); adj.setdefault(bid, []).append(aid)
+                elif st == 0:
+                    crossing.append({"line": key, "from_bus": pair[0], "to_bus": pair[1], "status": 0})
+            visited = set(); q = ["BUS-01"]
+            while q:
+                u = q.pop(0)
+                if u in visited: continue
+                visited.add(u)
+                for v in adj.get(u, []):
+                    if v not in visited: q.append(v)
+            reachable = {int(x.replace("BUS-", "")) for x in visited}
+            all_nodes_set = {int(n.get("node", 0)) for n in nodes_raw if n.get("node")}
+            if not outage_nodes:
+                outage_nodes = sorted(list(all_nodes_set - reachable))
+            energized_list = []; outage_list = []
+            for (a, b) in all_pairs:
+                if (a in reachable) != (b in reachable):
+                    energized_list.append(a if a in reachable else b)
+                    outage_list.append(b if a in reachable else a)
+            real_crossing = []
+            for ct in crossing:
+                a, b = ct["from_bus"], ct["to_bus"]
+                if (a in reachable) != (b in reachable):
+                    real_crossing.append({**ct, "energized_side_bus": a if a in reachable else b, "outage_side_bus": b if a in reachable else a})
+            boundary_data = {"energized_boundary_nodes": list(set(energized_list)), "outage_boundary_nodes": list(set(outage_list)),
+                             "dead_boundary_nodes": list(set(outage_list)), "crossing_ties": real_crossing,
+                             "boundary_nodes": [{"energized_bus": a if a in reachable else b, "outage_bus": b if a in reachable else a, "tie_line": f"{a}-{b}"} for (a,b) in all_pairs if (a in reachable) != (b in reachable)]}
+            print(f"[seq-log] case={cid} bfs_boundary energized={len(energized_list)} outage={len(outage_list)} crossing={len(real_crossing)}")
+        except Exception as e:
+            print(f"[seq-log] case={cid} bfs_failed: {e}")
+
+    fault_pair = parse_line_pair(fault_line)
+    fault_branch_index = None
+    if fault_pair:
+        a, b = fault_pair
+        for idx, (fa, fb) in enumerate(_IEEE33_TOPOLOGY_LINES):
+            if (fa == a and fb == b) or (fa == b and fb == a):
+                fault_branch_index = idx + 1; break
+
+    prepare_payload = {
+        "case_id": cid, "fault_line": fault_line, "analysis_line": fault_line,
+        "score_job_id": score_job_id, "time_index": body.get("time_index") or 0,
+        "fault_branch_index": fault_branch_index,
+        "outage_nodes": outage_nodes,
+        "boundary": boundary_data,
+        "selected_plan": {"plan_id": selected_plan_id, "open_lines": [fault_line],
+                          "close_lines": tie_lines_list, "tie_lines": tie_lines_list,
+                          "score": plan_raw.get("score"), "rank": plan_raw.get("rank")},
+    }
+
+    # 1. prepare
+    print(f"[seq-log] case={cid} action=prepare_start fault={fault_line} plan={selected_plan_id}")
+    prep = algo_prepare(prepare_payload)
+    print(f"[seq-log] case={cid} action=prepare_done http={prep.status} ok={prep.ok}")
+    prepare_ok = prep.ok and prep.status == 200 and prep.data.get("success") == True
+
+    if not prepare_ok:
+        # 降级本地规则
+        local_seq = _build_local_operation_sequence(fault_line or "8-9", plan_raw)
+        rec["sequence_json"] = local_seq
+        rec["workflow_status"] = "SEQUENCE_GENERATED"
+        return {
+            "success": True, "case_id": cid, "status": "SEQUENCE_GENERATED",
+            "operation_count": local_seq.get("operation_count", 0), "sequence": local_seq,
+            "algorithm_source": "local_fallback",
+            "notice": f"8010 prepare 不可用（HTTP {prep.status}），已降级本地规则。操作序列仅供演示参考。",
+        }
+
+    # 2. generate
+    gen = algo_gen(cid)
+    print(f"[seq-log] case={cid} action=generate_done http={gen.status} ok={gen.ok}")
+    if gen.ok:
+        ext = gen.data
+        inner_seq = ext.get("sequence", {})
+        seq_data = ext
+        op_count = ext.get("operation_count") or len(inner_seq.get("operations", inner_seq.get("steps", [])))
+        rec["sequence_json"] = seq_data
+        rec["workflow_status"] = "SEQUENCE_GENERATED"
+        return {
+            "success": True, "case_id": cid, "status": "SEQUENCE_GENERATED",
+            "operation_count": op_count, "sequence": seq_data,
+            "algorithm_source": "external_8010",
+            "notice": "操作序列草案，不具备现场执行授权。",
+        }
+
+    # generate 失败 → 降级
+    local_seq = _build_local_operation_sequence(fault_line or "8-9", plan_raw)
+    rec["sequence_json"] = local_seq
+    rec["workflow_status"] = "SEQUENCE_GENERATED"
+    return {
+        "success": True, "case_id": cid, "status": "SEQUENCE_GENERATED",
+        "operation_count": local_seq.get("operation_count", 0), "sequence": local_seq,
+        "algorithm_source": "local_fallback",
+        "notice": f"8010 generate 不可用（HTTP {gen.status}），已降级本地规则。",
+    }
+
+
+# ==================== 8010 安全校验（case_id 体系）====================
+
+@app.post("/api/safety/validate")
+def safety_validate_case(req: dict = None):
+    """安全校验（case_id 体系，调 8010）"""
+    from app.services.ieee33_algorithm_client import validateSafety as algo_safety
+
+    body = req or {}
+    cid = str(body.get("case_id") or "")
+    if not cid:
+        return {"success": False, "case_id": None, "passed": False, "error_type": "missing_case_id", "message": "缺少 case_id"}
+    rec = _case_registry.get(cid)
+    if rec is None:
+        # 尝试从前端传来的数据重建
+        frontend_seq = body.get("sequence")
+        frontend_fault = body.get("fault_line") or ""
+        frontend_plan = body.get("selected_plan_id") or ""
+        if isinstance(frontend_seq, dict) and frontend_seq and frontend_fault and frontend_plan:
+            print(f"[safety-log] case={cid} action=auto_rebuild")
+            rec = {"case_id": cid, "sequence_json": frontend_seq, "workflow_status": "SEQUENCE_GENERATED",
+                   "score_job_id": body.get("score_job_id") or "", "job_id": body.get("job_id") or "",
+                   "fault_line": frontend_fault, "selected_plan_id": frontend_plan,
+                   "selected_plan_json": body.get("selected_plan") or {},
+                   "safety_report_json": None, "formal_ticket_authorized": False,
+                   "created_at": datetime.now().isoformat(), "updated_at": datetime.now().isoformat(), "version": 1}
+            _case_registry[cid] = rec
+        else:
+            return {"success": False, "case_id": cid, "passed": False, "error_type": "case_not_found",
+                    "message": "案例不存在，请重新生成操作序列"}
+
+    seq = rec.get("sequence_json")
+    if not isinstance(seq, dict) or not seq:
+        return {"success": False, "case_id": cid, "passed": False, "error_type": "sequence_not_ready",
+                "message": "操作序列为空"}
+
+    # 提取内层 sequence（8010 response 有 sequence.sequence 嵌套）
+    safety_seq = seq
+    if isinstance(seq, dict) and "sequence" in seq and isinstance(seq["sequence"], dict):
+        inner = seq["sequence"]
+        if "operations" in inner or "device_registry" in inner:
+            safety_seq = inner
+
+    ticket_id = body.get("ticket_id") or f"TICKET-{cid}"
+    print(f"[safety-log] case={cid} action=safety_start")
+    result = algo_safety(case_id=cid, ticket_id=ticket_id, sequence=safety_seq, persist=False)
+    print(f"[safety-log] case={cid} action=safety_done http={result.status} ok={result.ok}")
+
+    if not result.ok:
+        detail = result.warning or result.error or ""
+        msg = "安全校验执行失败" + (f"（8010: {detail}）" if detail else "")
+        return {"success": False, "case_id": cid, "passed": False, "error_type": "safety_service_error",
+                "message": msg, "algo_detail": detail, "algo_http_status": result.status}
+
+    ext = result.data
+    passed = bool(ext.get("passed", ext.get("success", False)))
+    status = "SAFETY_PASSED" if passed else "SAFETY_BLOCKED"
+    rec["safety_report_json"] = ext
+    rec["workflow_status"] = status
+    return {"success": True, "case_id": cid, "status": status, "passed": passed,
+            "block_count": ext.get("block_count", 0), "warning_count": ext.get("warning_count", 0),
+            "persisted": False, "report": ext, "validation_level": "rule_validation_trial",
+            "formal_ticket_authorized": False}
 
 
 @app.on_event("startup")

@@ -3,7 +3,7 @@
  * 输入：current_ticket / current_operation_steps / current_selected_plan
  */
 
-export interface ApiOperationStep { step: number; action: string; operation_type: string; line?: string; description?: string; }
+export interface ApiOperationStep { step: number; action: string; operation_type: string; line?: string; description?: string; actionRaw?: string; }
 export interface CheckItem { id: string; item: string; result: '通过' | '不通过' | '警告'; level: 'error' | 'warning'; detail: string; }
 export interface SafetyCheckResult {
   success: boolean; passed: boolean; status: 'passed' | 'passed_with_warnings' | 'failed';
@@ -17,6 +17,24 @@ export function normLineKey(ln: string): string {
   if (p.length !== 2) return String(ln);
   const a = parseInt(p[0]), b = parseInt(p[1]);
   return isNaN(a) || isNaN(b) ? String(ln) : a < b ? `${a}-${b}` : `${b}-${a}`;
+}
+
+/** 从 currentWorkflow 直接读取数据进行校验（不依赖正式票，安全校验在成票之前） */
+export function runSafetyChecks(params: {
+  workflow_id?: string; fault_line: string; plan_id: string;
+  tie_lines: string[]; operation_steps: ApiOperationStep[]; selected_plan: any;
+}): SafetyCheckResult {
+  const { workflow_id, fault_line, plan_id, tie_lines, operation_steps: steps, selected_plan: plan } = params;
+  const wfId = workflow_id || `WF${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}`;
+  return runRuleChecks({
+    ticket_id: wfId,
+    fault_line,
+    plan_id,
+    tie_lines: tie_lines || [],
+    operation_steps: steps,
+    created_at: new Date().toLocaleString('zh-CN'),
+    source: 'realtime_workflow',
+  }, steps, plan);
 }
 
 export function runRuleChecks(ticket: any, steps: ApiOperationStep[], plan: any): SafetyCheckResult {

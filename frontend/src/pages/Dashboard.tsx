@@ -3,117 +3,126 @@ import PageContainer from '../layouts/PageContainer';
 import MetricCard from '../components/MetricCard';
 import SectionCard from '../components/SectionCard';
 import IEEE33Topology from '../components/topology/IEEE33Topology';
-import WorkflowProgress from '../components/WorkflowProgress';
 import { realtimeApi } from '../services/apiClient';
 import { getCurrentWorkflow } from '../store/workflowStore';
 import type { RealtimeLatest, RealtimeNode } from '../services/apiClient';
-import type { DashboardSummary } from '../types';
 
-const flowSteps = [
-  { title: '数据导入', desc: '拓扑/台账/量测' },
-  { title: '源荷预测', desc: '短时负荷/风险识别' },
-  { title: '边界判定', desc: '故障隔离/解列' },
-  { title: '转供决策', desc: '多目标路径优化' },
-  { title: '序列生成', desc: '操作步骤编排' },
-  { title: '模板化成票', desc: '标准操作票输出' },
-  { title: '安全校核', desc: '多维规则校验' },
-  { title: '人工审核', desc: '审批/回写/归档' },
-];
-
-// 服务状态摘要结构
-interface ServiceStatus {
-  simulink: { ok: boolean; text: string };
-  forecast: { ok: boolean; text: string; detail: string };
-  candidates: { ok: boolean; text: string; detail: string };
-  scoring: { ok: boolean; text: string; detail: string };
+/* ============ 调度核心指标 ============ */
+interface CoreMetrics {
+  total_load_kw: number;
+  min_voltage_pu: number;
+  min_voltage_node: number;
+  voltage_below_095: number;
+  voltage_below_097: number;
+  overloaded_lines: { line: string; load_pct: number }[];
+  max_load_pct: number;
+  max_load_line: string;
+  node_count: number;
+  line_count: number;
 }
 
-function computeRealtimeMetrics(nodes: RealtimeNode[]) {
+function computeCoreMetrics(nodes: RealtimeNode[], lines: any[]): CoreMetrics {
   const total_load_kw = nodes.reduce((s, n) => s + (n.load_kw || 0), 0);
-  const voltages = nodes.map(n => n.voltage_pu).filter(v => v !== undefined && v !== null) as number[];
-  const avg_voltage_pu = voltages.length > 0 ? voltages.reduce((s, v) => s + v, 0) / voltages.length : 0;
-  const min_voltage_pu = voltages.length > 0 ? Math.min(...voltages) : 0;
-  const high_risk_count = nodes.filter(n => n.risk_level === 'high').length;
-  const realtime_node_count = nodes.length;
-  return { total_load_kw, avg_voltage_pu, min_voltage_pu, high_risk_count, realtime_node_count };
+  const voltages = nodes
+    .filter(n => n.voltage_pu != null)
+    .map(n => ({ node: n.node, v: n.voltage_pu as number }));
+  const minEntry = voltages.length > 0
+    ? voltages.reduce((a, b) => (a.v < b.v ? a : b))
+    : { node: 0, v: 1.0 };
+  const below_095 = voltages.filter(x => x.v < 0.95).length;
+  const below_097 = voltages.filter(x => x.v < 0.97).length;
+
+  // 线路负载率（简单估算：负荷/额定容量，缺额定值时按节点负荷之和比例估算）
+  const overloaded_lines: { line: string; load_pct: number }[] = [];
+  let max_load_pct = 0;
+  let max_load_line = '-';
+  const RATED_DEFAULT = 5000; // 缺额定值时默认容量 kW
+  for (const l of lines) {
+    const lineName = l.line || l.name || '';
+    const rated = l.rated_kw || l.capacity_kw || RATED_DEFAULT;
+    const current = l.current_load_kw || l.load_kw || l.power_kw || 0;
+    const load_pct = rated > 0 ? Math.round((current / rated) * 1000) / 10 : 0;
+    if (load_pct > 80) overloaded_lines.push({ line: lineName, load_pct });
+    if (load_pct > max_load_pct) { max_load_pct = load_pct; max_load_line = lineName; }
+  }
+  overloaded_lines.sort((a, b) => b.load_pct - a.load_pct);
+
+  return {
+    total_load_kw, min_voltage_pu: minEntry.v, min_voltage_node: minEntry.node,
+    voltage_below_095: below_095, voltage_below_097: below_097,
+    overloaded_lines, max_load_pct, max_load_line,
+    node_count: nodes.length, line_count: lines.length,
+  };
 }
 
-function fmtVal(v: number, d = 1): string { return Number.isFinite(v) ? v.toFixed(d) : '--'; }
+function fmt(v: number, d = 1): string { return Number.isFinite(v) ? v.toFixed(d) : '--'; }
 
-// 服务状态指示器组件
-function StatusDot({ ok }: { ok: boolean }) {
+/* ============ 辅助组件 ============ */
+
+/** 紧凑状态条 — 4 项挤在一行 */
+function CompactStatusBar({ services }: { services: any }) {
+  const items = [
+    { label: '实时数据', ok: services.simulink?.ok, text: services.simulink?.text || '-' },
+    { label: '源荷预测', ok: services.forecast?.ok, text: services.forecast?.text || '-' },
+    { label: '候选生成', ok: services.candidates?.ok, text: services.candidates?.text || '-' },
+    { label: '潮流评分', ok: services.scoring?.ok, text: services.scoring?.text || '-' },
+  ];
   return (
-    <span style={{
-      display: 'inline-block', width: 8, height: 8, borderRadius: '50%',
-      background: ok ? '#1f8a4c' : '#f2c94c',
-      marginRight: 6, verticalAlign: 'middle',
-      boxShadow: ok ? '0 0 4px rgba(31,138,76,0.4)' : '0 0 4px rgba(242,201,76,0.4)',
-    }} />
+    <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', fontSize: 11, color: '#667085' }}>
+      {items.map(it => (
+        <span key={it.label}>
+          <span style={{
+            display: 'inline-block', width: 7, height: 7, borderRadius: '50%',
+            background: it.ok ? '#1f8a4c' : '#f2c94c',
+            marginRight: 4, verticalAlign: 'middle',
+          }} />
+          {it.label}：<span style={{ color: it.ok ? '#1f8a4c' : '#b8860b', fontWeight: 500 }}>{it.text}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/** 快捷跳转按钮 */
+function JumpBtn({ label, to }: { label: string; to: string }) {
+  return (
+    <button
+      onClick={() => window.location.href = to}
+      style={{
+        padding: '4px 12px', borderRadius: 4, border: '1px solid #1f8a4c',
+        background: '#e8f5e9', color: '#1f8a4c', fontSize: 11, fontWeight: 600,
+        cursor: 'pointer', whiteSpace: 'nowrap',
+      }}
+    >
+      {label} →
+    </button>
   );
 }
 
 export default function Dashboard() {
-  const [summary, setSummary] = useState<DashboardSummary | null>(null);
   const [realtimeData, setRealtimeData] = useState<RealtimeLatest | null>(null);
   const [dataSource, setDataSource] = useState<'realtime' | 'fallback'>('fallback');
-  const [rtMetrics, setRtMetrics] = useState<ReturnType<typeof computeRealtimeMetrics> | null>(null);
-  const [services, setServices] = useState<ServiceStatus>({
+  const [metrics, setMetrics] = useState<CoreMetrics | null>(null);
+  const [services, setServices] = useState({
     simulink: { ok: false, text: '检测中...' },
-    forecast: { ok: false, text: '检测中...', detail: '' },
-    candidates: { ok: false, text: '检测中...', detail: '' },
-    scoring: { ok: false, text: '检测中...', detail: '' },
+    forecast: { ok: false, text: '检测中...' },
+    candidates: { ok: false, text: '检测中...' },
+    scoring: { ok: false, text: '检测中...' },
   });
 
-  // 获取算法服务健康状态
-  const fetchAlgoHealth = async () => {
-    try {
-      const r = await fetch('http://localhost:8000/api/algorithm/health');
-      const d = await r.json();
-      if (d.available) {
-        const caps = d.capabilities?.modules || {};
-        setServices(prev => ({
-          ...prev,
-          forecast: caps.forecast
-            ? { ok: true, text: '可用', detail: '外部算法服务正常' }
-            : { ok: false, text: '不可用', detail: '接口待实现' },
-          candidates: caps.candidate_generation
-            ? { ok: true, text: '可用', detail: '外部候选方案生成可用' }
-            : { ok: false, text: '不可用', detail: '暂未接入' },
-          scoring: caps.full_pipeline || caps.matpower_online
-            ? { ok: true, text: '可用', detail: 'MATPOWER 在线模式' }
-            : { ok: false, text: '不可用', detail: '计算中或未接入' },
-        }));
-      } else {
-        setServices(prev => ({
-          ...prev,
-          forecast: { ok: false, text: '不可用', detail: '外部服务未连接' },
-          candidates: { ok: false, text: '不可用', detail: '外部服务未连接' },
-          scoring: { ok: false, text: '不可用', detail: '外部服务未连接' },
-        }));
-      }
-    } catch {
-      setServices(prev => ({
-        ...prev,
-        forecast: { ok: false, text: '不可用', detail: '外部服务未连接' },
-        candidates: { ok: false, text: '不可用', detail: '外部服务未连接' },
-        scoring: { ok: false, text: '不可用', detail: '外部服务未连接' },
-      }));
-    }
-  };
-
+  // ---- 实时数据轮询 ----
   useEffect(() => {
     let mounted = true;
-
-    function pollRealtime() {
+    function poll() {
       realtimeApi.getLatest().then((data) => {
         if (!mounted) return;
-        if (data?.success && data.has_data && data.nodes && data.nodes.length > 0) {
+        if (data?.success && data.nodes?.length) {
           setRealtimeData(data);
           setDataSource('realtime');
-          setRtMetrics(computeRealtimeMetrics(data.nodes));
+          setMetrics(computeCoreMetrics(data.nodes, data.lines || []));
           setServices(prev => ({
             ...prev,
-            simulink: { ok: true, text: '正常', detail: `实时同步 · ${data.nodes.length} 节点 · ${data.lines?.length || 0} 线路` },
+            simulink: { ok: true, text: `${data.nodes.length}节点·${data.lines?.length || 0}线路` },
           }));
         } else {
           setRealtimeData(data);
@@ -121,220 +130,197 @@ export default function Dashboard() {
           setServices(prev => ({
             ...prev,
             simulink: data?.source_tag === 'none'
-              ? { ok: false, text: '暂无数据', detail: '等待 Simulink 推送' }
-              : { ok: false, text: '演示数据', detail: '使用本地静态拓扑' },
+              ? { ok: false, text: '等待推送' }
+              : { ok: false, text: '仿真数据' },
           }));
-          fetchSummary();
         }
       }).catch(() => {
-        if (!mounted) return;
-        setDataSource('fallback');
-        setServices(prev => ({
-          ...prev,
-          simulink: { ok: false, text: '未连接', detail: '后端未返回实时数据' },
-        }));
-        fetchSummary();
+        if (!mounted) setDataSource('fallback');
       });
     }
-
-    pollRealtime();
-    fetchAlgoHealth();
-    const timer = setInterval(pollRealtime, 4000);
-    const healthTimer = setInterval(fetchAlgoHealth, 30000);
-    return () => { mounted = false; clearInterval(timer); clearInterval(healthTimer); };
+    // 算法服务状态
+    function checkAlgo() {
+      fetch('http://localhost:8000/api/algorithm/health')
+        .then(r => r.json()).then(d => {
+          if (!mounted) return;
+          const caps = d.capabilities?.modules || {};
+          const ok = d.available === true;
+          setServices(prev => ({
+            ...prev,
+            forecast: ok && caps.forecast ? { ok: true, text: '可用' } : { ok: false, text: '本地' },
+            candidates: ok && caps.candidate_generation ? { ok: true, text: '可用' } : { ok: false, text: '离线' },
+            scoring: ok && (caps.full_pipeline || caps.matpower_online) ? { ok: true, text: '在线' } : { ok: false, text: '离线' },
+          }));
+        }).catch(() => {});
+    }
+    poll(); checkAlgo();
+    const t1 = setInterval(poll, 5000);
+    const t2 = setInterval(checkAlgo, 30000);
+    return () => { mounted = false; clearInterval(t1); clearInterval(t2); };
   }, []);
 
-  function fetchSummary() {
-    fetch('http://localhost:8000/api/dashboard/summary')
-      .then((r) => r.json())
-      .then((res) => { if (res.data) setSummary(res.data); })
-      .catch(() => {
-        setSummary({ totalEvents: 12, totalTickets: 28, safetyPassRate: 92.5, manualInterventionRate: 7.5 });
-      });
-  }
-
-  function getSourceLabel(): { text: string; bg: string; color: string; border: string } {
+  // ---- 数据来源标签 ----
+  function getSourceTag() {
     if (dataSource === 'fallback') {
       const tag = realtimeData?.source_tag || '';
-      if (tag === 'none') return { text: '📭 暂无实时数据', bg: '#f3f6f9', color: '#667085', border: '#c8d6e5' };
-      return { text: '⚠ 演示数据', bg: '#fff8e1', color: '#b8860b', border: '#f2c94c' };
+      if (tag === 'none') return { text: '暂无实时数据', bg: '#f3f6f9', color: '#667085' };
+      return { text: '仿真验证模式 · IEEE33', bg: '#fff8e1', color: '#b8860b' };
     }
     const tag = realtimeData?.source_tag || '';
     const trusted = realtimeData?.trusted_source === true;
     if ((tag === 'simulink' || tag === 'matlab') && trusted) {
-      return { text: '📡 Simulink实时数据', bg: '#e8f5e9', color: '#1f8a4c', border: '#a5d6a7' };
+      return { text: 'Simulink 实时数据', bg: '#e8f5e9', color: '#1f8a4c' };
     }
-    if (tag === 'unverified_simulink') {
-      return { text: '⚠ 未验证Simulink数据', bg: '#ffebee', color: '#e74c3c', border: '#ffcdd2' };
-    }
-    if ((tag === 'simulink' || tag === 'matlab') && !trusted) {
-      return { text: '⚠ 未验证Simulink数据', bg: '#ffebee', color: '#e74c3c', border: '#ffcdd2' };
-    }
-    if (tag === 'test') return { text: '🧪 测试实时数据', bg: '#e3f0ff', color: '#2f80ed', border: '#90caf9' };
-    if (tag === 'manual') return { text: '🔧 手动测试数据', bg: '#fff8e1', color: '#e67e22', border: '#f2c94c' };
-    if (tag === 'mock') return { text: '🔬 模拟实时数据', bg: '#e3f0ff', color: '#2f80ed', border: '#90caf9' };
-    if (tag === 'none') return { text: '📭 暂无实时数据', bg: '#f3f6f9', color: '#667085', border: '#c8d6e5' };
-    if (tag === 'static') return { text: '📋 静态拓扑数据', bg: '#f3f6f9', color: '#667085', border: '#c8d6e5' };
-    return { text: `🔧 测试数据(${tag || '未知'})`, bg: '#fff8e1', color: '#e67e22', border: '#f2c94c' };
+    return { text: '实时数据（未验证）', bg: '#fff8e1', color: '#b8860b' };
   }
+  const sourceTag = getSourceTag();
 
-  const sourceLabel = getSourceLabel();
-
-  // 当前处置流程摘要
+  // ---- 当前处置流程 ----
   const wf = useMemo(() => getCurrentWorkflow(), [realtimeData]);
   const wfStage = useMemo(() => {
-    if (!wf) return null;
+    if (!wf?.fault_line) return null;
     if (!wf.selected_plan) return '转供决策';
     if (!wf.operation_sequence) return '操作序列生成';
-    if (!wf.ticket) return '模板化成票';
     if (!wf.safety_result) return '安全校验';
+    if (!wf.ticket) return '模板化成票';
     return '已完成';
   }, [wf]);
 
-  // 操作票数据来源标注
-  const ticketTrend = dataSource === 'realtime' && realtimeData?.trusted_source
-    ? '本月真实归档' : '演示统计';
-
-  const sourceTagStyle: React.CSSProperties = {
-    display: 'inline-block', padding: '2px 10px', borderRadius: 10,
-    fontSize: 10, fontWeight: 600, marginLeft: 8, verticalAlign: 'middle',
+  const stageJumpMap: Record<string, string> = {
+    '转供决策': '/transfer-decision',
+    '操作序列生成': '/sequence-generation',
+    '安全校验': '/safety-check',
+    '模板化成票': '/ticket-generation',
+    '已完成': '/ticket-generation',
   };
 
   return (
     <PageContainer title="系统主界面">
-      {/* 快捷说明 + 数据来源指示 */}
+      {/* ====== 1. 交互提示 + 数据来源 ====== */}
       <div style={{
         background: '#e3f0ff', border: '1px solid #90caf9', borderRadius: 6,
-        padding: '10px 16px', marginBottom: 16, fontSize: 12, color: '#1f2937',
+        padding: '8px 16px', marginBottom: 14, fontSize: 11, color: '#1f2937',
         display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8,
       }}>
         <span>
           💡 <strong>交互提示：</strong>点击拓扑图中的<strong>节点</strong>查看负荷与电压详情 |
           点击<strong>线路</strong>查看参数并可设为故障 |
-          点击<strong>联络开关(T1-T5)</strong>查看转供能力
+          点击<strong>联络开关 T1-T5</strong> 查看转供能力
         </span>
-        <span style={{ ...sourceTagStyle, background: sourceLabel.bg, color: sourceLabel.color, border: `1px solid ${sourceLabel.border}` }}>
-          {sourceLabel.text}
+        <span style={{
+          padding: '2px 10px', borderRadius: 10, fontSize: 10, fontWeight: 600,
+          background: sourceTag.bg, color: sourceTag.color, border: `1px solid ${sourceTag.color}33`,
+        }}>
+          {sourceTag.text}
         </span>
       </div>
 
-      {/* 指标卡片 */}
-      <div style={{ display: 'flex', gap: 14, marginBottom: 20, flexWrap: 'wrap' }}>
-        {dataSource === 'realtime' && rtMetrics ? (
+      {/* ====== 2. 核心指标卡（4 项，纯实时数据驱动） ====== */}
+      <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
+        {metrics ? (
           <>
-            <MetricCard label="实时节点数量" value={rtMetrics.realtime_node_count} unit="个" color="#1f8a4c" trend="实时同步" trendColor="#1f8a4c" />
-            <MetricCard label="系统总负荷" value={fmtVal(rtMetrics.total_load_kw)} unit="kW" color="#2f80ed" trend="实时计算" trendColor="#2f80ed" />
-            <MetricCard label="平均电压" value={fmtVal(rtMetrics.avg_voltage_pu, 3)} unit="pu" color="#1f8a4c" trend={rtMetrics.avg_voltage_pu < 0.97 ? '偏低' : '正常'} trendColor={rtMetrics.avg_voltage_pu < 0.97 ? '#f2c94c' : '#1f8a4c'} />
-            <MetricCard label="最低电压" value={fmtVal(rtMetrics.min_voltage_pu, 3)} unit="pu" color={rtMetrics.min_voltage_pu < 0.95 ? '#eb5757' : '#f2c94c'} trend={rtMetrics.min_voltage_pu < 0.95 ? '⚠ 越限' : '关注'} trendColor={rtMetrics.min_voltage_pu < 0.95 ? '#eb5757' : '#f2c94c'} />
-            <MetricCard label="高风险节点" value={rtMetrics.high_risk_count} unit="个" color={rtMetrics.high_risk_count > 0 ? '#eb5757' : '#1f8a4c'} trend={rtMetrics.high_risk_count > 0 ? '需关注' : '正常'} trendColor={rtMetrics.high_risk_count > 0 ? '#eb5757' : '#1f8a4c'} />
-            <MetricCard label="已导出操作票" value={summary?.totalTickets ?? 28} unit="张" color="#1f8a4c" trend={ticketTrend} trendColor="#1f8a4c" />
+            <MetricCard
+              label="系统总负荷" value={fmt(metrics.total_load_kw)} unit="kW"
+              color="#2f80ed" trend={metrics.total_load_kw > 3000 ? '重载' : '正常'}
+              trendColor={metrics.total_load_kw > 3000 ? '#f2c94c' : '#1f8a4c'}
+            />
+            <MetricCard
+              label="最低电压" value={fmt(metrics.min_voltage_pu, 3)} unit="pu"
+              color={metrics.min_voltage_pu < 0.95 ? '#eb5757' : '#1f8a4c'}
+              trend={`节点 ${metrics.min_voltage_node} · ${metrics.min_voltage_pu < 0.95 ? '⚠ 越限' : metrics.min_voltage_pu < 0.97 ? '偏低' : '正常'}`}
+              trendColor={metrics.min_voltage_pu < 0.95 ? '#eb5757' : metrics.min_voltage_pu < 0.97 ? '#f2c94c' : '#1f8a4c'}
+            />
+            <MetricCard
+              label="电压偏低节点" value={metrics.voltage_below_097} unit="个"
+              color={metrics.voltage_below_095 > 0 ? '#eb5757' : metrics.voltage_below_097 > 0 ? '#f2c94c' : '#1f8a4c'}
+              trend={metrics.voltage_below_095 > 0 ? `其中 ${metrics.voltage_below_095} 个低于 0.95 pu` : ' ≥0.97 pu 正常'}
+              trendColor={metrics.voltage_below_095 > 0 ? '#eb5757' : '#1f8a4c'}
+            />
+            <MetricCard
+              label="线路重载" value={metrics.overloaded_lines.length} unit="条"
+              color={metrics.overloaded_lines.length > 0 ? '#eb5757' : '#1f8a4c'}
+              trend={metrics.overloaded_lines.length > 0 ? `最重载: ${metrics.max_load_line} ${metrics.max_load_pct}%` : '全部 80% 以下'}
+              trendColor={metrics.overloaded_lines.length > 0 ? '#eb5757' : '#1f8a4c'}
+            />
           </>
         ) : (
           <>
-            <MetricCard label="今日故障事件" value={summary?.totalEvents ?? 12} unit="起" color="#eb5757" trend="较昨日 +2" trendColor="#eb5757" />
-            <MetricCard label="待成票任务" value={5} unit="张" color="#2f80ed" trend="处理中" trendColor="#2f80ed" />
-            <MetricCard label="安全校验通过率" value={summary?.safetyPassRate ?? 92.5} unit="%" color="#1f8a4c" trend="正常" trendColor="#1f8a4c" />
-            <MetricCard label="高危馈线数" value={3} unit="条" color="#f2c94c" trend="需关注" trendColor="#f2c94c" />
-            <MetricCard label="待人工复核" value={3} unit="项" color="#f2c94c" trend="3 项待处理" trendColor="#f2c94c" />
-            <MetricCard label="已导出操作票" value={summary?.totalTickets ?? 28} unit="张" color="#1f8a4c" trend={ticketTrend} trendColor="#1f8a4c" />
+            <MetricCard label="系统总负荷" value="--" unit="kW" color="#94a3b8" trend="等待实时数据" trendColor="#94a3b8" />
+            <MetricCard label="最低电压" value="--" unit="pu" color="#94a3b8" trend="等待实时数据" trendColor="#94a3b8" />
+            <MetricCard label="电压偏低节点" value="--" unit="个" color="#94a3b8" trend="等待实时数据" trendColor="#94a3b8" />
+            <MetricCard label="线路重载" value="--" unit="条" color="#94a3b8" trend="等待实时数据" trendColor="#94a3b8" />
           </>
         )}
       </div>
 
-      {/* 服务状态摘要 —— 替代原 PredictPanel + FlaskPanel */}
-      <SectionCard title="服务状态" style={{ marginBottom: 16 }}>
-        <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', fontSize: 12 }}>
-          <div style={{ flex: 1, minWidth: 180 }}>
-            <StatusDot ok={services.simulink.ok} />
-            <span style={{ fontWeight: 600, color: '#1f2937' }}>Simulink 实时数据：</span>
-            <span style={{ color: services.simulink.ok ? '#1f8a4c' : '#b8860b' }}>{services.simulink.text}</span>
-            <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2, marginLeft: 14 }}>{services.simulink.detail || ''}</div>
-          </div>
-          <div style={{ flex: 1, minWidth: 180 }}>
-            <StatusDot ok={services.forecast.ok} />
-            <span style={{ fontWeight: 600, color: '#1f2937' }}>源荷预测：</span>
-            <span style={{ color: services.forecast.ok ? '#1f8a4c' : '#b8860b' }}>{services.forecast.text}</span>
-            <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2, marginLeft: 14 }}>{services.forecast.detail || '当前使用本地规则版'}</div>
-          </div>
-          <div style={{ flex: 1, minWidth: 180 }}>
-            <StatusDot ok={services.candidates.ok} />
-            <span style={{ fontWeight: 600, color: '#1f2937' }}>候选生成：</span>
-            <span style={{ color: services.candidates.ok ? '#1f8a4c' : '#b8860b' }}>{services.candidates.text}</span>
-            <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2, marginLeft: 14 }}>{services.candidates.detail || ''}</div>
-          </div>
-          <div style={{ flex: 1, minWidth: 180 }}>
-            <StatusDot ok={services.scoring.ok} />
-            <span style={{ fontWeight: 600, color: '#1f2937' }}>潮流评分：</span>
-            <span style={{ color: services.scoring.ok ? '#1f8a4c' : '#b8860b' }}>{services.scoring.text}</span>
-            <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2, marginLeft: 14 }}>{services.scoring.detail || ''}</div>
-          </div>
-        </div>
-      </SectionCard>
-
-      {/* 当前处置流程摘要 */}
-      <SectionCard title="当前处置流程" style={{ marginBottom: 16 }}>
-        {wf ? (
-          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, alignItems: 'center' }}>
-            <span><span style={{ color: '#667085' }}>故障线路：</span><strong style={{ color: '#eb5757' }}>{wf.fault_line || '-'}</strong></span>
+      {/* ====== 3. 紧凑状态栏 + 当前处置流程（同行） ====== */}
+      <div style={{
+        display: 'flex', gap: 12, marginBottom: 14, flexWrap: 'wrap',
+        background: '#fff', border: '1px solid #c8d6e5', borderRadius: 6,
+        padding: '8px 16px', alignItems: 'center',
+      }}>
+        <CompactStatusBar services={services} />
+        <span style={{ color: '#c8d6e5' }}>|</span>
+        {wf?.fault_line ? (
+          <span style={{ fontSize: 11, color: '#1f2937', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <span>故障线路：<strong style={{ color: '#eb5757' }}>{wf.fault_line}</strong></span>
             <span style={{ color: '#c8d6e5' }}>|</span>
-            <span><span style={{ color: '#667085' }}>当前阶段：</span><strong style={{ color: '#1f8a4c' }}>{wfStage}</strong></span>
-            <span style={{ color: '#c8d6e5' }}>|</span>
-            <span><span style={{ color: '#667085' }}>方案编号：</span><strong style={{ color: wf.selected_plan_id ? '#1f8a4c' : '#94a3b8' }}>{wf.selected_plan_id || '未选择'}</strong></span>
-            <span style={{ color: '#c8d6e5' }}>|</span>
-            <span><span style={{ color: '#667085' }}>联络线：</span><strong style={{ color: '#1f8a4c' }}>{(wf.selected_tie_lines || []).join('、') || '未选择'}</strong></span>
-            {wf.sequence_result?.plan_id && (
-              <><span style={{ color: '#c8d6e5' }}>|</span>
-              <span><span style={{ color: '#667085' }}>序列编号：</span><strong>{wf.sequence_result.plan_id}</strong></span></>
-            )}
-            {wf.ticket?.ticket_id && (
-              <><span style={{ color: '#c8d6e5' }}>|</span>
-              <span><span style={{ color: '#667085' }}>票号：</span><strong style={{ color: '#1f8a4c' }}>{wf.ticket.ticket_id}</strong></span></>
+            <span>阶段：<strong style={{ color: '#1f8a4c' }}>{wfStage}</strong></span>
+            {wf.selected_plan_id && (
+              <>
+                <span style={{ color: '#c8d6e5' }}>|</span>
+                <span>方案：<strong>{wf.selected_plan_id}</strong></span>
+                <span style={{ color: '#c8d6e5' }}>|</span>
+                <span>联络线：<strong style={{ color: '#1f8a4c' }}>{(wf.selected_tie_lines || []).join('、') || '-'}</strong></span>
+              </>
             )}
             {wf.safety_result && (
-              <><span style={{ color: '#c8d6e5' }}>|</span>
-              <span><span style={{ color: '#667085' }}>安全校验：</span>
-              <span style={{
-                fontSize: 11, fontWeight: 600, padding: '1px 8px', borderRadius: 3,
-                background: wf.safety_result.status === 'passed' ? '#e8f5e9' : wf.safety_result.status === 'passed_with_warnings' ? '#fff8e1' : '#ffebee',
-                color: wf.safety_result.status === 'passed' ? '#1f8a4c' : wf.safety_result.status === 'passed_with_warnings' ? '#b8860b' : '#eb5757',
-              }}>{wf.safety_result.status === 'failed' ? '不通过' : wf.safety_result.status === 'passed_with_warnings' ? '有条件通过' : '通过'}</span></span></>
+              <>
+                <span style={{ color: '#c8d6e5' }}>|</span>
+                <span style={{
+                  fontSize: 10, fontWeight: 600, padding: '1px 6px', borderRadius: 3,
+                  background: wf.safety_result.status === 'passed' ? '#e8f5e9' : '#ffebee',
+                  color: wf.safety_result.status === 'passed' ? '#1f8a4c' : '#eb5757',
+                }}>
+                  {wf.safety_result.status === 'failed' ? '不通过' : wf.safety_result.status === 'passed_with_warnings' ? '有条件通过' : '安全通过'}
+                </span>
+              </>
             )}
-            {wf.transfer_status === 'external_pending' && (
-              <span style={{ fontSize: 10, background: '#fff8e1', color: '#b8860b', borderRadius: 3, padding: '1px 6px', border: '1px solid #f2c94c' }}>待外部评分</span>
+            {stageJumpMap[wfStage || ''] && (
+              <JumpBtn label={`进入${wfStage}`} to={stageJumpMap[wfStage!]} />
             )}
-          </div>
+          </span>
         ) : (
-          <div style={{ textAlign: 'center', padding: 16, color: '#94a3b8', fontSize: 12 }}>
-            暂无当前处置流程。请从拓扑图选择故障线路后前往「边界判定」开始流程。
-          </div>
+          <span style={{ fontSize: 11, color: '#94a3b8' }}>
+            暂无处置流程 — 在拓扑图中选择线路开始故障处置
+          </span>
         )}
-      </SectionCard>
+      </div>
 
-      {/* IEEE 33 单线图 */}
-      <SectionCard title="配电网拓扑图 · IEEE 33 节点单线图" style={{ marginBottom: 20 }}>
+      {/* ====== 4. 电网拓扑图 — 核心视觉锚点 ====== */}
+      <SectionCard title="配电网拓扑图 · IEEE 33 节点" style={{ marginBottom: 14 }}>
         <IEEE33Topology predictData={null} realtimeData={realtimeData} />
       </SectionCard>
 
-      {/* 系统业务流程 */}
-      <SectionCard title="系统业务流程">
-        <WorkflowProgress currentStep="fault" />
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 12 }}>
-          {flowSteps.map((step, i) => (
-            <div key={step.title} style={{ display: 'flex', alignItems: 'center', flex: 1, minWidth: 0 }}>
-              <div style={{
-                background: '#fff', border: '1px solid #c8d6e5', borderRadius: 6,
-                padding: '10px 8px', textAlign: 'center', flex: 1,
-              }}>
-                <div style={{ fontWeight: 600, fontSize: 12, color: '#1f8a4c', marginBottom: 2 }}>{step.title}</div>
-                <div style={{ fontSize: 10, color: '#94a3b8' }}>{step.desc}</div>
-              </div>
-              {i < flowSteps.length - 1 && (
-                <div style={{ color: '#c8d6e5', fontSize: 14, padding: '0 2px', flexShrink: 0 }}>→</div>
-              )}
-            </div>
-          ))}
+      {/* ====== 5. 告警摘要（当存在越限/重载时显示） ====== */}
+      {metrics && (metrics.voltage_below_095 > 0 || metrics.overloaded_lines.length > 0) && (
+        <div style={{
+          background: '#fff5f5', border: '1px solid #ffcdd2', borderRadius: 6,
+          padding: '10px 16px', fontSize: 12, color: '#e74c3c',
+        }}>
+          <strong>⚠ 运行风险提示：</strong>
+          {metrics.voltage_below_095 > 0 && (
+            <span style={{ marginRight: 16 }}>
+              {metrics.voltage_below_095} 个节点电压低于 0.95 pu（最低 Bus-{metrics.min_voltage_node} = {fmt(metrics.min_voltage_pu, 3)} pu）
+            </span>
+          )}
+          {metrics.overloaded_lines.length > 0 && (
+            <span>
+              {metrics.overloaded_lines.length} 条线路负载率超 80%：{metrics.overloaded_lines.slice(0, 3).map(l => `${l.line}(${l.load_pct}%)`).join('、')}
+            </span>
+          )}
         </div>
-      </SectionCard>
+      )}
     </PageContainer>
   );
 }

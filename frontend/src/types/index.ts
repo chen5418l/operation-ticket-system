@@ -74,7 +74,8 @@ export interface OperationStep {
   stage: string;
   deviceId: string;
   deviceName: string;
-  action: string;
+  action: string;         // 中文展示值：拉开/合闸/核查
+  actionRaw?: string;     // 8010 原始值：open/close/check/verify_open — 供安全校验
   preState: string;
   postState: string;
   ruleTags: string[];

@@ -21,7 +21,7 @@ export interface CurrentWorkflow {
   transfer_result?: any;
   transfer_status?: string;       // 'external_pending' | 'completed' | 'local_fallback'
   job_id?: string;
-  selected_plan_id?: string;      // ALG-001 / ALG-002 / ... 或本地 tie_switch
+  selected_plan_id?: string;      // 已确认方案编号：外部候选 ALG-001/ALG-002/ALG-003，或本地方案 tie_switch 如 9-15
   selected_plan?: any;            // 完整的 TransferPlanItem
   selected_tie_ids?: string[];    // ['T2'] 或 ['T5']
   selected_tie_lines?: string[];  // ['9-15'] 或 ['25-29']
@@ -152,11 +152,12 @@ export function clearWorkflowState(): void {
 
 /** 根据 state 判断当前流程步骤索引 (0-based) */
 export function getCurrentStepIndex(): number {
+  // 步骤索引：0=故障输入, 1=边界判定, 2=转供决策, 3=操作序列, 4=安全校验, 5=模板成票, 6=归档
   const wf = getCurrentWorkflow();
-  if (!wf) return 1;                            // 待边界判定
-  if (!wf.selected_plan) return 2;              // 待转供决策
-  if (!wf.operation_sequence) return 3;          // 待操作序列
-  if (!wf.ticket) return 4;                     // 待模板成票
-  if (!wf.safety_result) return 5;              // 待安全校验
-  return 6;                                      // 全部完成
+  if (!wf || !wf.fault_line) return 0;           // 待故障输入
+  if (!wf.selected_plan) return 1;               // 待转供决策（边界判定后）
+  if (!wf.operation_sequence) return 2;           // 待操作序列
+  if (!wf.safety_result) return 3;               // 待安全校验
+  if (!wf.ticket) return 4;                      // 待模板成票
+  return 5;                                       // 全部完成（归档）
 }

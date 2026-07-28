@@ -139,6 +139,26 @@ def safetyValidate(payload: dict) -> AlgoResult:
     return postJson("/api/v1/safety/validate", payload)
 
 
+def prepareSequence(payload: dict) -> AlgoResult:
+    """POST /api/v1/ticket-cases/prepare — 动态案例同步到 8010"""
+    return postJson("/api/v1/ticket-cases/prepare", payload, timeout_ms=60000)
+
+
+def generateSequence(case_id: str) -> AlgoResult:
+    """POST /api/v1/operation-sequence/generate — 操作序列生成（prepare 成功后调用）"""
+    return postJson("/api/v1/operation-sequence/generate", {"case_id": case_id}, timeout_ms=60000)
+
+
+def validateSafety(case_id: str, ticket_id: str, sequence: dict, persist: bool = False) -> AlgoResult:
+    """POST /api/v1/safety/validate — case_id 体系安全校验"""
+    return postJson("/api/v1/safety/validate", {
+        "case_id": case_id,
+        "ticket_id": ticket_id,
+        "sequence": sequence,
+        "persist": persist,
+    }, timeout_ms=60000)
+
+
 # ---- 异步任务轮询 ----
 def getJob(job_id: str) -> AlgoResult:
     """GET /api/v1/jobs/{job_id} — 查询任务状态"""

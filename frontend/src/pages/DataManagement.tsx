@@ -1,277 +1,442 @@
-import { useState, useRef } from 'react';
+import { useEffect, useState } from 'react';
 import PageContainer from '../layouts/PageContainer';
 import DataTable from '../components/DataTable';
-import StatusBadge from '../components/StatusBadge';
 import SectionCard from '../components/SectionCard';
 
-// ============ 演示数据对象（标注"演示数据"） ============
-interface DataObjectRow {
-  id: string;
-  name: string;
-  content: string;
-  source: string;          // 数据来源
-  version: string;          // 版本
-  updatedAt: string;        // 更新时间
-  modules: string;          // 使用模块
-  productionReady: string;  // 可用于正式流程
-  status: string;
-  detailRows: string[];
-}
+/* ==================== 类型 ==================== */
+interface RealtimeNode { node: number; load_kw: number; voltage_pu: number; pv_kw: number; ev_kw: number; risk_level: string; }
+interface RealtimeLine { line: string; current_a: number; power_kw: number; status: number; }
+interface TopoBranch { from: number; to: number; r: number; x: number; status?: number; }
+interface TopoTieSwitch { id: string; from: number; to: number; line: string; rated_kw?: number; }
 
-const dataObjects: DataObjectRow[] = [
-  { id: '1', name: 'IEEE33 节点数据', content: 'Bus1-Bus33 节点基础信息：编号、负荷、电压、所属馈线、坐标',
-    source: '内置演示', version: 'IEEE33 标准测试模型', updatedAt: '2026-07-05（系统初始化）', modules: '拓扑可视化、故障分析', productionReady: '否（演示数据）',
-    status: '已加载', detailRows: ['节点总数：33','电源节点：Bus1','负荷节点：Bus2-Bus33','主馈线：Bus1-Bus18','分支：Bus19-Bus22 / Bus23-Bus25 / Bus26-Bus33'] },
-  { id: '2', name: '线路拓扑数据', content: '32条主干线 + 5条联络线的连接关系及阻抗参数',
-    source: '内置演示', version: 'IEEE33 标准测试模型', updatedAt: '2026-07-05（系统初始化）', modules: '故障分析、边界判定、转供决策', productionReady: '否（演示数据）',
-    status: '已加载', detailRows: ['主干线：32条','联络线：5条(T1-T5)','线路状态：Simulink 实时更新'] },
-  { id: '3', name: '联络开关数据', content: 'T1-T5 常开联络开关：转供容量、负载率、安全校验结果',
-    source: '实时 + 内置演示', version: '实时', updatedAt: '实时（随 Simulink 推送更新）', modules: '转供决策、安全校验', productionReady: '部分（容量为演示默认值）',
-    status: '实时同步', detailRows: ['T1: Bus8-21 (容量 1200kW)','T2: Bus9-15 (容量 1200kW)','T3: Bus12-22 (容量 1200kW)','T4: Bus18-33 (容量 1200kW)','T5: Bus25-29 (容量 500kW)','注：容量为 IEEE33 标准默认值，非实际设备参数'] },
-  { id: '4', name: '运行限值数据', content: '电压上下限 (0.90-1.10pu)、负载率上限 (80%)、N-1 裕度要求',
-    source: '内置示例', version: 'v1.0 示例限值', updatedAt: '2026-07-05', modules: '转供决策、安全校验', productionReady: '否（示例限值）',
-    status: '示例数据', detailRows: ['电压上限：1.10 pu','电压下限：0.90 pu','负载率预警：80%','负载率上限：100%','N-1 裕度：≥20%','⚠ 以上为 IEEE33 标准参考值，非实际电网定值'] },
-  { id: '5', name: '操作票模板', content: '故障隔离、负荷转供、恢复供电标准操作步骤模板',
-    source: '内置示例', version: 'v1.0 示例模板', updatedAt: '2026-07-05', modules: '操作序列生成、模板化成票', productionReady: '否（示例模板）',
-    status: '示例数据', detailRows: ['模板1：馈线故障隔离','模板2：联络开关转供恢复','模板3：运行方式调整','模板4：恢复供电操作','⚠ 当前为演示模板，不适用于真实调度场景'] },
-  { id: '6', name: '安全校验规则', content: '防误操作规则(五防)、越限校验、孤岛校验、操作顺序校验',
-    source: '内置示例', version: 'v1.0 示例规则', updatedAt: '2026-07-05', modules: '安全校验', productionReady: '否（示例规则）',
-    status: '示例数据', detailRows: ['规则1：设备状态校验','规则2：倒闸顺序校验','规则3：拓扑关系校验','规则4：容量约束校验','规则5：N-1约束校验','规则6：FA策略校验','规则7：五防互锁校验','规则8：人工修改复校','⚠ 当前为内置示例规则，非实际安全校验规则'] },
+/* ==================== 静态定义 ==================== */
+const TIE_DEFAULTS = [
+  { id: 'T1', line: '8-21', from: 8, to: 21, ratedKw: 1200 },
+  { id: 'T2', line: '9-15', from: 9, to: 15, ratedKw: 1200 },
+  { id: 'T3', line: '12-22', from: 12, to: 22, ratedKw: 1200 },
+  { id: 'T4', line: '18-33', from: 18, to: 33, ratedKw: 1200 },
+  { id: 'T5', line: '25-29', from: 25, to: 29, ratedKw: 500 },
 ];
 
-// ============ 规则/模板维护数据 ============
-interface RuleTemplateRow {
-  id: string;
-  name: string;
-  purpose: string;
-  version: string;
-  effectiveVersion: string;   // 当前生效版本
-  modules: string;            // 适用模块
-  usedInCurrentFlow: string;  // 当前流程是否使用
-  changeImpact: string;       // 修改影响说明
-  status: string;
-}
-
-const ruleTemplates: RuleTemplateRow[] = [
-  { id: '1', name: '故障隔离模板', purpose: '生成故障隔离操作序列', version: 'v1.0',
-    effectiveVersion: 'v1.0（示例）', modules: '操作序列生成', usedInCurrentFlow: '是（演示流程）', changeImpact: '影响所有新生成的操作票中故障隔离步骤的内容和顺序',
-    status: '启用' },
-  { id: '2', name: '转供恢复模板', purpose: '生成转供恢复操作序列', version: 'v1.0',
-    effectiveVersion: 'v1.0（示例）', modules: '操作序列生成', usedInCurrentFlow: '是（演示流程）', changeImpact: '影响负荷转移和恢复供电阶段的操作内容',
-    status: '启用' },
-  { id: '3', name: '安全校验规则', purpose: '校验操作票是否满足安全约束', version: 'v1.0',
-    effectiveVersion: 'v1.0（示例）', modules: '安全校验', usedInCurrentFlow: '是（演示流程）', changeImpact: '影响所有安全校验项的判定标准和阈值',
-    status: '启用' },
-  { id: '4', name: 'IEEE33 拓扑模板', purpose: '初始化标准测试系统数据', version: 'v1.0',
-    effectiveVersion: 'v1.0（示例）', modules: '拓扑可视化、故障分析', usedInCurrentFlow: '是（演示流程）', changeImpact: '影响整个系统的拓扑基础和故障分析结果',
-    status: '启用' },
+const SAFETY_RULES = [
+  { id: 'R1', name: '设备状态校验', severity: '阻断', category: '五防', description: '操作前确认被操作设备处于可操作状态，断路器与隔离开关状态匹配，无接地刀闸合闸时送电', applyTo: '全部操作步骤' },
+  { id: 'R2', name: '倒闸顺序校验', severity: '阻断', category: '操作顺序', description: '停电：先断断路器→再拉隔离开关；送电：先合隔离开关→再合断路器。严禁带负荷拉合隔离开关', applyTo: '开断/闭合步骤' },
+  { id: 'R3', name: '拓扑关系校验', severity: '阻断', category: '拓扑', description: '转供后网络保持辐射状(无环网)，无孤立节点，联络开关闭合后对应分段开关断开', applyTo: '转供步骤' },
+  { id: 'R4', name: '容量约束校验', severity: '阻断', category: '潮流', description: '转供后线路和变压器负载不超过额定容量，联络线转供容量不超过限值，电压不越限', applyTo: '转供步骤' },
+  { id: 'R5', name: 'N-1 约束校验', severity: '警告', category: '潮流', description: '转供后系统仍满足 N-1 准则：任一元件故障退出后，剩余元件不过载、电压不越限', applyTo: '方案级校验' },
+  { id: 'R6', name: 'FA 策略校验', severity: '警告', category: '自动化', description: '转供方案需与馈线自动化(FA)策略兼容，不产生 FA 逻辑冲突或误动风险', applyTo: '方案级校验' },
+  { id: 'R7', name: '五防互锁校验', severity: '阻断', category: '五防', description: '防止误分误合断路器、防止带负荷拉合隔离开关、防止带电合接地刀闸、防止带地线送电、防止误入带电间隔', applyTo: '全部操作步骤' },
+  { id: 'R8', name: '人工修改复校', severity: '警告', category: '审核', description: '任何对自动生成操作序列的人工修改，必须经第二人复核确认后方可生效', applyTo: '人工修改后' },
 ];
 
-// ============ 状态卡 ============
-const statusCards = [
-  { label: '拓扑模型', status: '已导入', desc: '演示模型', note: 'IEEE33 标准测试系统' },
-  { label: '设备台账', status: '演示台账', desc: '非生产数据', note: 'Bus1-Bus33 示例参数' },
-  { label: '运行限值', status: '示例限值', desc: 'IEEE33 标准参考值', note: '非实际电网定值' },
-  { label: '开关状态', status: '实时同步', desc: 'Simulink 推送', note: '随实时数据更新' },
-  { label: '规则模板', status: '示例规则 v1.0', desc: '5套模板', note: '内置演示，不可在线编辑' },
+const TICKET_TEMPLATES = [
+  { id: 'TPL1', name: '馈线故障隔离', steps: [
+    { seq: 1, action: '确认故障', detail: '根据保护动作信号和故障录波，确认故障馈线和故障区段' },
+    { seq: 2, action: '断开馈线断路器', detail: '遥控或就地断开故障馈线出口断路器' },
+    { seq: 3, action: '拉开两侧隔离开关', detail: '依次拉开故障区段两侧隔离开关，形成明显断开点' },
+    { seq: 4, action: '验电', detail: '在故障区段两侧验电，确认无电压' },
+    { seq: 5, action: '挂接地线', detail: '在故障区段两侧挂接地线' },
+  ]},
+  { id: 'TPL2', name: '联络开关转供恢复', steps: [
+    { seq: 1, action: '确认联络开关状态', detail: '确认联络开关处于分闸位置，两侧隔离开关已合上' },
+    { seq: 2, action: '核对相序', detail: '核对联络开关两侧相序一致' },
+    { seq: 3, action: '合联络开关', detail: '遥控或就地合上联络开关' },
+    { seq: 4, action: '确认负荷转移', detail: '检查负荷转移情况，确认无过载' },
+    { seq: 5, action: '调整运行方式', detail: '根据需要调整运行方式，恢复对停电区段供电' },
+  ]},
+  { id: 'TPL3', name: '运行方式调整', steps: [
+    { seq: 1, action: '制定调整方案', detail: '根据负荷预测和N-1分析，制定运行方式调整方案' },
+    { seq: 2, action: '合环操作', detail: '先合联络开关形成合环运行（短时）' },
+    { seq: 3, action: '解环操作', detail: '断开指定分段开关，恢复辐射状运行' },
+    { seq: 4, action: '潮流校验', detail: '调整后校验电压和负载率均在限值内' },
+  ]},
+  { id: 'TPL4', name: '恢复供电操作', steps: [
+    { seq: 1, action: '拆除接地线', detail: '依次拆除故障区段两侧接地线' },
+    { seq: 2, action: '合上隔离开关', detail: '依次合上故障区段两侧隔离开关' },
+    { seq: 3, action: '合上断路器', detail: '合上馈线出口断路器，恢复供电' },
+    { seq: 4, action: '确认供电恢复', detail: '检查电压和负荷，确认供电恢复正常' },
+    { seq: 5, action: '汇报调度', detail: '向调度汇报操作完成，记录操作时间' },
+  ]},
 ];
 
-// ============ 数据导入步骤（仅前端预览） ============
-const importSteps = [
-  { label: '选择文件', desc: '上传 Excel/CSV' },
-  { label: '字段预览', desc: '匹配数据字段' },
-  { label: '数据校验', desc: '格式与完整性检查' },
-  { label: '版本管理', desc: '新旧版本对比' },
-  { label: '发布生效', desc: '导入并生效' },
+const LIMITS = [
+  { item: '电压上限', value: '1.10 pu', basis: 'GB/T 12325 供电电压偏差', note: '10kV 及以下三相供电电压偏差不超过标称电压的 ±7%' },
+  { item: '电压下限', value: '0.90 pu', basis: 'GB/T 12325', note: '正常运行方式下不低于 0.90 pu；故障后不低于 0.85 pu' },
+  { item: '负载率预警', value: '80%', basis: '调度运行规程', note: '超过 80% 时发出预警，提醒调度员关注' },
+  { item: '负载率上限', value: '100%', basis: '设备额定容量', note: '正常运行不超过额定容量；N-1 故障后可短时超过 100%' },
+  { item: 'N-1 裕度', value: '≥20%', basis: 'DL/T 5729 配电网规划设计技术导则', note: '单条线路故障退出后，剩余线路负载不超过 100%' },
+  { item: '短路电流', value: '≤20 kA', basis: '断路器开断能力', note: '短路电流不超过断路器额定开断电流' },
 ];
 
-export default function DataManagement() {
-  const [detail, setDetail] = useState<{ title: string; rows: string[] } | null>(null);
-  const [selectedFile, setSelectedFile] = useState<string | null>(null);
-  const [importStep, setImportStep] = useState(-1);
-  const fileRef = useRef<HTMLInputElement>(null);
+function fmt(v: number, d = 1): string { return Number.isFinite(v) ? v.toFixed(d) : '--'; }
 
-  // ====== 数据对象列 ======
-  const objectColumns = [
-    { key: 'name', title: '数据对象', dataIndex: 'name' as const, width: 130 },
-    { key: 'content', title: '维护内容', dataIndex: 'content' as const, render: (r: DataObjectRow) => <span style={{ wordBreak:'break-all', fontSize: 12 }}>{r.content}</span> },
-    { key: 'source', title: '数据来源', dataIndex: 'source' as const, width: 100, render: (r: DataObjectRow) => (
-      <span style={{ fontSize: 11, color: r.source.includes('演示') || r.source.includes('示例') ? '#b8860b' : '#667085' }}>{r.source}</span>
-    )},
-    { key: 'version', title: '版本', dataIndex: 'version' as const, width: 90, render: (r: DataObjectRow) => <span style={{ fontSize: 11 }}>{r.version}</span> },
-    { key: 'updatedAt', title: '更新时间', dataIndex: 'updatedAt' as const, width: 110, render: (r: DataObjectRow) => <span style={{ fontSize: 11 }}>{r.updatedAt}</span> },
-    { key: 'modules', title: '使用模块', dataIndex: 'modules' as const, width: 130, render: (r: DataObjectRow) => <span style={{ fontSize: 11 }}>{r.modules}</span> },
-    { key: 'productionReady', title: '可用于正式流程', dataIndex: 'productionReady' as const, width: 110, render: (r: DataObjectRow) => (
-      <span style={{ fontSize: 11, fontWeight: 600, color: r.productionReady.startsWith('否') ? '#eb5757' : r.productionReady.startsWith('部分') ? '#b8860b' : '#1f8a4c' }}>{r.productionReady}</span>
-    )},
-    { key: 'action', title: '', width: 50, render: (r: DataObjectRow) => (
-      <button onClick={() => setDetail({ title: r.name, rows: r.detailRows })}
-        style={{ padding:'2px 10px', borderRadius:4, border:'1px solid #1f8a4c', background:'#fff', color:'#1f8a4c', cursor:'pointer', fontSize:11 }}>
-        详情
-      </button>
-    )},
-  ];
+/* ==================== 详情弹窗（根据类型渲染不同内容） ==================== */
+function DetailModal({ title, type, onClose, data }: {
+  title: string; type: string; onClose: () => void;
+  data: { nodes?: RealtimeNode[]; lines?: RealtimeLine[]; branches?: TopoBranch[]; ties?: TopoTieSwitch[] };
+}) {
+  const renderContent = () => {
+    switch (type) {
+      // ---- 节点数据 ----
+      case 'nodes': {
+        const nodes = data.nodes || [];
+        if (!nodes.length) return <p style={{ color:'#94a3b8', fontSize:13 }}>暂无实时节点数据</p>;
+        return (
+          <div>
+            <p style={{ fontSize:11, color:'#667085', marginBottom:10 }}>
+              共 {nodes.length} 个节点（数据来源：Simulink 实时推送）
+            </p>
+            <table style={{ width:'100%', borderCollapse:'collapse', fontSize:11 }}>
+              <thead>
+                <tr style={{ borderBottom:'2px solid #e2e8f0', textAlign:'left', color:'#667085' }}>
+                  <th style={{ padding:'5px 8px' }}>Bus</th><th style={{ padding:'5px 8px' }}>负荷(kW)</th>
+                  <th style={{ padding:'5px 8px' }}>电压(pu)</th><th style={{ padding:'5px 8px' }}>光伏(kW)</th>
+                  <th style={{ padding:'5px 8px' }}>充电(kW)</th><th style={{ padding:'5px 8px' }}>风险</th>
+                </tr>
+              </thead>
+              <tbody>
+                {nodes.map(n => (
+                  <tr key={n.node} style={{ borderBottom:'1px solid #f3f6f9' }}>
+                    <td style={{ padding:'4px 8px', fontWeight:600 }}>Bus-{n.node}</td>
+                    <td style={{ padding:'4px 8px' }}>{fmt(n.load_kw, 1)}</td>
+                    <td style={{ padding:'4px 8px', color: n.voltage_pu < 0.95 ? '#eb5757' : n.voltage_pu < 0.97 ? '#b8860b' : '#1f2937', fontWeight: n.voltage_pu < 0.95 ? 600 : 400 }}>
+                      {fmt(n.voltage_pu, 4)}
+                    </td>
+                    <td style={{ padding:'4px 8px', color:'#94a3b8' }}>{fmt(n.pv_kw, 1)}</td>
+                    <td style={{ padding:'4px 8px', color:'#94a3b8' }}>{fmt(n.ev_kw, 1)}</td>
+                    <td style={{ padding:'4px 8px' }}>
+                      <span style={{ padding:'1px 5px', borderRadius:2, fontSize:9, fontWeight:600,
+                        background: n.risk_level === 'high' ? '#ffebee' : n.risk_level === 'medium' ? '#fff8e1' : '#e8f5e9',
+                        color: n.risk_level === 'high' ? '#eb5757' : n.risk_level === 'medium' ? '#b8860b' : '#1f8a4c',
+                      }}>{n.risk_level === 'high' ? '高' : n.risk_level === 'medium' ? '中' : '低'}</span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        );
+      }
 
-  // ====== 规则/模板列 ======
-  const ruleColumns = [
-    { key: 'name', title: '规则/模板', dataIndex: 'name' as const, width: 120 },
-    { key: 'purpose', title: '用途', dataIndex: 'purpose' as const, width: 130 },
-    { key: 'effectiveVersion', title: '当前生效版本', dataIndex: 'effectiveVersion' as const, width: 110, render: (r: RuleTemplateRow) => <span style={{ fontSize: 11 }}>{r.effectiveVersion}</span> },
-    { key: 'modules', title: '适用模块', dataIndex: 'modules' as const, width: 100, render: (r: RuleTemplateRow) => <span style={{ fontSize: 11 }}>{r.modules}</span> },
-    { key: 'usedInCurrentFlow', title: '当前流程是否使用', dataIndex: 'usedInCurrentFlow' as const, width: 110, render: (r: RuleTemplateRow) => (
-      <span style={{ fontSize: 11, color: r.usedInCurrentFlow.startsWith('是') ? '#1f8a4c' : '#94a3b8' }}>{r.usedInCurrentFlow}</span>
-    )},
-    { key: 'changeImpact', title: '修改影响说明', dataIndex: 'changeImpact' as const, render: (r: RuleTemplateRow) => <span style={{ fontSize: 11, color: '#667085' }}>{r.changeImpact}</span> },
-    { key: 'action', title: '', width: 50, render: (r: RuleTemplateRow) => (
-      <button onClick={() => setDetail({ title: r.name, rows: [
-        `用途：${r.purpose}`, `当前生效版本：${r.effectiveVersion}`, `适用模块：${r.modules}`,
-        `当前流程是否使用：${r.usedInCurrentFlow}`, `修改影响说明：${r.changeImpact}`,
-        '当前版本暂不支持在线编辑模板内容',
-      ]})}
-        style={{ padding:'2px 10px', borderRadius:4, border:'1px solid #1f8a4c', background:'#fff', color:'#1f8a4c', cursor:'pointer', fontSize:11 }}>
-        详情
-      </button>
-    )},
-  ];
+      // ---- 线路数据 ----
+      case 'lines': {
+        const lines = data.lines || [];
+        const branches = data.branches || [];
+        const branchMap: Record<string, TopoBranch> = {};
+        for (const b of branches) {
+          branchMap[`${b.from}-${b.to}`] = b;
+          branchMap[`${b.to}-${b.from}`] = b;
+        }
+        if (!lines.length) return <p style={{ color:'#94a3b8', fontSize:13 }}>暂无实时线路数据</p>;
+        return (
+          <div>
+            <p style={{ fontSize:11, color:'#667085', marginBottom:10 }}>
+              共 {lines.length} 条线路（实时电流/功率 + 静态阻抗参数）
+            </p>
+            <table style={{ width:'100%', borderCollapse:'collapse', fontSize:11 }}>
+              <thead>
+                <tr style={{ borderBottom:'2px solid #e2e8f0', textAlign:'left', color:'#667085' }}>
+                  <th style={{ padding:'5px 8px' }}>线路</th><th style={{ padding:'5px 8px' }}>电流(A)</th>
+                  <th style={{ padding:'5px 8px' }}>功率(kW)</th><th style={{ padding:'5px 8px' }}>状态</th>
+                  <th style={{ padding:'5px 8px' }}>r(pu)</th><th style={{ padding:'5px 8px' }}>x(pu)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {lines.map(l => {
+                  const b = branchMap[l.line] || {} as TopoBranch;
+                  return (
+                    <tr key={l.line} style={{ borderBottom:'1px solid #f3f6f9' }}>
+                      <td style={{ padding:'4px 8px', fontWeight:600, fontFamily:'monospace' }}>{l.line}</td>
+                      <td style={{ padding:'4px 8px' }}>{fmt(l.current_a, 2)}</td>
+                      <td style={{ padding:'4px 8px' }}>{fmt(l.power_kw, 1)}</td>
+                      <td style={{ padding:'4px 8px' }}>
+                        <span style={{ padding:'1px 5px', borderRadius:2, fontSize:9, fontWeight:600,
+                          background: l.status === 1 ? '#e8f5e9' : '#ffebee',
+                          color: l.status === 1 ? '#1f8a4c' : '#eb5757',
+                        }}>{l.status === 1 ? '合' : '开'}</span>
+                      </td>
+                      <td style={{ padding:'4px 8px', color:'#94a3b8', fontFamily:'monospace' }}>{b.r != null ? b.r.toFixed(4) : '-'}</td>
+                      <td style={{ padding:'4px 8px', color:'#94a3b8', fontFamily:'monospace' }}>{b.x != null ? b.x.toFixed(4) : '-'}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        );
+      }
 
-  // ====== 导入流程点击 ======
-  const handleImportStep = (i: number) => {
-    setImportStep(i);
-    if (i === 0) { fileRef.current?.click(); return; }
-    if (i === 1 && !selectedFile) { alert('请先在步骤1中选择文件'); return; }
-    // 诚实：步骤 2-4 均为前端预览，不伪造导入成功
-    alert('当前版本仅支持前端选择文件与字段预览，真实导入/发布/回滚待后端实现。');
-  };
+      // ---- 联络开关 ----
+      case 'ties': {
+        const ties = data.ties || [];
+        const items = ties.length >= 5 ? ties : TIE_DEFAULTS;
+        return (
+          <div>
+            <p style={{ fontSize:11, color:'#667085', marginBottom:10 }}>
+              {ties.length >= 5 ? `共 ${ties.length} 组联络开关（来源：拓扑数据）` : '共 5 组联络开关（IEEE33 标准配置）'}
+            </p>
+            <table style={{ width:'100%', borderCollapse:'collapse', fontSize:11 }}>
+              <thead>
+                <tr style={{ borderBottom:'2px solid #e2e8f0', textAlign:'left', color:'#667085' }}>
+                  <th style={{ padding:'5px 8px' }}>编号</th><th style={{ padding:'5px 8px' }}>线路</th>
+                  <th style={{ padding:'5px 8px' }}>源端 Bus</th><th style={{ padding:'5px 8px' }}>对端 Bus</th>
+                  <th style={{ padding:'5px 8px' }}>额定容量(kW)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {items.map((t: any, i: number) => (
+                  <tr key={i} style={{ borderBottom:'1px solid #f3f6f9' }}>
+                    <td style={{ padding:'4px 8px', fontWeight:700, color:'#1f8a4c' }}>{t.id || `T${i+1}`}</td>
+                    <td style={{ padding:'4px 8px', fontFamily:'monospace' }}>{t.line || `${t.from}-${t.to}`}</td>
+                    <td style={{ padding:'4px 8px' }}>Bus-{t.from}</td>
+                    <td style={{ padding:'4px 8px' }}>Bus-{t.to}</td>
+                    <td style={{ padding:'4px 8px', fontWeight:600 }}>{t.ratedKw || t.rated_kw || '-'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div style={{ marginTop:10, fontSize:10, color:'#94a3b8' }}>
+              联络开关正常运行时常开。转供时闭合，通过联络线将失电负荷转移至相邻馈线。
+            </div>
+          </div>
+        );
+      }
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0];
-    if (f) { setSelectedFile(f.name); setImportStep(1); }
+      // ---- 运行限值 ----
+      case 'limits':
+        return (
+          <div>
+            <table style={{ width:'100%', borderCollapse:'collapse', fontSize:11 }}>
+              <thead>
+                <tr style={{ borderBottom:'2px solid #e2e8f0', textAlign:'left', color:'#667085' }}>
+                  <th style={{ padding:'5px 8px' }}>限值项</th><th style={{ padding:'5px 8px' }}>定值</th>
+                  <th style={{ padding:'5px 8px' }}>依据</th><th style={{ padding:'5px 8px' }}>说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                {LIMITS.map((l, i) => (
+                  <tr key={i} style={{ borderBottom:'1px solid #f3f6f9' }}>
+                    <td style={{ padding:'5px 8px', fontWeight:600 }}>{l.item}</td>
+                    <td style={{ padding:'5px 8px', fontFamily:'monospace', fontWeight:700, color:'#1f8a4c' }}>{l.value}</td>
+                    <td style={{ padding:'5px 8px', color:'#667085' }}>{l.basis}</td>
+                    <td style={{ padding:'5px 8px', color:'#1f2937' }}>{l.note}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div style={{ marginTop:10, fontSize:10, color:'#b8860b', background:'#fff8e1', padding:'6px 10px', borderRadius:4 }}>
+              ⚠️ 以上为 IEEE33 标准参考值和通用规程要求。实际运行限值需由电网运方部门根据本网实际情况核定。
+            </div>
+          </div>
+        );
+
+      // ---- 操作票模板 ----
+      case 'templates':
+        return (
+          <div>
+            {TICKET_TEMPLATES.map(tpl => (
+              <div key={tpl.id} style={{ marginBottom: 16 }}>
+                <h4 style={{ fontSize:13, fontWeight:600, color:'#1f2937', marginBottom:6 }}>
+                  {tpl.id} {tpl.name}
+                </h4>
+                <table style={{ width:'100%', borderCollapse:'collapse', fontSize:11 }}>
+                  <thead>
+                    <tr style={{ borderBottom:'2px solid #e2e8f0', textAlign:'left', color:'#667085' }}>
+                      <th style={{ padding:'4px 8px', width:40 }}>序号</th>
+                      <th style={{ padding:'4px 8px', width:130 }}>操作</th>
+                      <th style={{ padding:'4px 8px' }}>详细说明</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {tpl.steps.map(s => (
+                      <tr key={s.seq} style={{ borderBottom:'1px solid #f3f6f9' }}>
+                        <td style={{ padding:'4px 8px', fontWeight:600, color:'#1f8a4c' }}>{s.seq}</td>
+                        <td style={{ padding:'4px 8px', fontWeight:500 }}>{s.action}</td>
+                        <td style={{ padding:'4px 8px', color:'#1f2937' }}>{s.detail}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ))}
+          </div>
+        );
+
+      default:
+        return <p style={{ color:'#94a3b8', fontSize:13 }}>暂无详细数据</p>;
+    }
   };
 
   return (
+    <div style={{ position:'fixed', top:0, left:0, right:0, bottom:0,
+      background:'rgba(0,0,0,0.35)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:1000 }}
+      onClick={onClose}>
+      <div style={{ background:'#fff', borderRadius:8, padding:24, width:820, maxWidth:'95vw', maxHeight:'80vh', overflow:'auto', boxShadow:'0 8px 32px rgba(0,0,0,0.2)' }}
+        onClick={e => e.stopPropagation()}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:16, paddingBottom:12, borderBottom:'1px solid #e2e8f0' }}>
+          <h3 style={{ fontSize:15, fontWeight:600, color:'#1f2937', margin:0 }}>{title}</h3>
+          <button onClick={onClose} style={{ padding:'4px 12px', borderRadius:4, border:'1px solid #c8d6e5', background:'#f3f6f9', color:'#667085', cursor:'pointer', fontSize:12 }}>
+            ✕ 关闭
+          </button>
+        </div>
+        {renderContent()}
+      </div>
+    </div>
+  );
+}
+
+/* ==================== 主组件 ==================== */
+export default function DataManagement() {
+  const [detail, setDetail] = useState<{ title: string; type: string } | null>(null);
+  const [algoAvailable, setAlgoAvailable] = useState(false);
+  const [realtimeStatus, setRealtimeStatus] = useState<string>('检测中...');
+  const [rtNodes, setRtNodes] = useState<RealtimeNode[]>([]);
+  const [rtLines, setRtLines] = useState<RealtimeLine[]>([]);
+  const [topoBranches, setTopoBranches] = useState<TopoBranch[]>([]);
+  const [topoTies, setTopoTies] = useState<TopoTieSwitch[]>([]);
+
+  // 拉取实时数据 + 拓扑数据
+  useEffect(() => {
+    // 算法状态
+    fetch('http://localhost:8000/api/algorithm/health')
+      .then(r => r.json()).then(d => setAlgoAvailable(d.available === true)).catch(() => {});
+
+    // Simulink 实时数据
+    fetch('http://localhost:8000/api/realtime/latest')
+      .then(r => r.json()).then(d => {
+        if (d?.success && d.nodes?.length) {
+          setRtNodes(d.nodes);
+          setRtLines(d.lines || []);
+          setRealtimeStatus(`${d.source_tag || '实时'} · ${d.nodes.length}节点 · ${(d.lines||[]).length}线路`);
+        } else {
+          setRealtimeStatus('仿真模式（无实时推送）');
+        }
+      }).catch(() => setRealtimeStatus('后端未连接'));
+
+    // 拓扑数据（拿阻抗参数）
+    fetch('http://localhost:8000/api/topology/ieee33')
+      .then(r => r.json()).then(d => {
+        if (d?.code === 200 && d.data) {
+          setTopoBranches(d.data.branches || []);
+          setTopoTies(d.data.tieSwitches || []);
+        }
+      }).catch(() => {});
+  }, []);
+
+  // ---- 数据对象定义 ----
+  const dataObjects = [
+    { id: '1', name: 'IEEE33 节点数据', type: 'nodes', content: 'Bus1-Bus33：实时负荷(kW)、电压(pu)、光伏/充电、风险等级', source: rtNodes.length > 0 ? 'Simulink 实时' : '内置模型', modules: '拓扑可视化、故障分析', ready: rtNodes.length > 0 },
+    { id: '2', name: '线路拓扑数据', type: 'lines', content: '37条线路：实时电流(A)、功率(kW)、开关状态 + 静态阻抗参数(r,x)', source: rtLines.length > 0 ? 'Simulink 实时' : '内置模型', modules: '故障分析、边界判定、转供决策', ready: rtLines.length > 0 },
+    { id: '3', name: '联络开关配置', type: 'ties', content: 'T1-T5 常开联络开关：额定容量、两端 Bus、转供能力', source: '内置模型', modules: '转供决策', ready: false },
+    { id: '4', name: '运行限值定值', type: 'limits', content: '电压上下限(0.90-1.10pu)、负载率上限(100%)、N-1 裕度(≥20%)、短路电流', source: '内置示例', modules: '安全校验', ready: false },
+    { id: '5', name: '操作票模板', type: 'templates', content: '4套标准模板：故障隔离、转供恢复、方式调整、恢复供电', source: '内置示例', modules: '操作序列生成、模板化成票', ready: false },
+    { id: '6', name: '安全校验规则', type: 'rules', content: '8项校验规则：五防、倒闸顺序、拓扑、容量、N-1、FA策略、五防互锁、人工复校', source: '内置示例', modules: '安全校验', ready: false },
+  ];
+
+  // ---- 数据对象列 ----
+  const objectColumns = [
+    { key: 'name', title: '数据对象', dataIndex: 'name' as const, width: 120, render: (r: typeof dataObjects[0]) => (
+      <span style={{ fontWeight: 600, fontSize: 12 }}>{r.name}</span>
+    )},
+    { key: 'content', title: '维护内容', dataIndex: 'content' as const, render: (r: typeof dataObjects[0]) => <span style={{ wordBreak:'break-all', fontSize: 11 }}>{r.content}</span> },
+    { key: 'source', title: '数据来源', dataIndex: 'source' as const, width: 90, render: (r: typeof dataObjects[0]) => (
+      <span style={{ fontSize: 10, fontWeight:500, padding:'1px 5px', borderRadius:3,
+        background: r.ready ? '#e8f5e9' : '#fff8e1',
+        color: r.ready ? '#1f8a4c' : '#b8860b',
+      }}>{r.source}</span>
+    )},
+    { key: 'modules', title: '使用模块', dataIndex: 'modules' as const, width: 150, render: (r: typeof dataObjects[0]) => <span style={{ fontSize: 10 }}>{r.modules}</span> },
+    { key: 'action', title: '', width: 52, render: (r: typeof dataObjects[0]) => (
+      <button onClick={() => setDetail({ title: r.name, type: r.type })}
+        style={{ padding:'3px 10px', borderRadius:4, border:'1px solid #1f8a4c', background:'#fff', color:'#1f8a4c', cursor:'pointer', fontSize:10, fontWeight:600 }}>
+        查看详情
+      </button>
+    )},
+  ];
+
+  // ---- 安全规则列 ----
+  const ruleColumns = [
+    { key: 'id', title: '编号', dataIndex: 'id' as const, width: 36, render: (r: typeof SAFETY_RULES[0]) => <span style={{ fontSize: 10, fontFamily:'monospace', color:'#667085' }}>{r.id}</span> },
+    { key: 'name', title: '规则名称', dataIndex: 'name' as const, width: 115 },
+    { key: 'severity', title: '级别', dataIndex: 'severity' as const, width: 48, render: (r: typeof SAFETY_RULES[0]) => (
+      <span style={{ fontSize: 10, fontWeight: 600, padding: '1px 6px', borderRadius: 2,
+        background: r.severity === '阻断' ? '#ffebee' : '#fff8e1',
+        color: r.severity === '阻断' ? '#eb5757' : '#b8860b',
+      }}>{r.severity}</span>
+    )},
+    { key: 'category', title: '类别', dataIndex: 'category' as const, width: 52, render: (r: typeof SAFETY_RULES[0]) => <span style={{ fontSize: 10, color:'#667085' }}>{r.category}</span> },
+    { key: 'description', title: '规则说明', dataIndex: 'description' as const, render: (r: typeof SAFETY_RULES[0]) => <span style={{ fontSize: 11 }}>{r.description}</span> },
+    { key: 'applyTo', title: '适用范围', dataIndex: 'applyTo' as const, width: 90, render: (r: typeof SAFETY_RULES[0]) => <span style={{ fontSize: 10, color:'#94a3b8' }}>{r.applyTo}</span> },
+  ];
+
+  return (
     <PageContainer title="数据管理">
-      {/* ====== 顶部提示横幅 ====== */}
+      {/* ====== 1. 顶部提示 ====== */}
       <div style={{
         background: '#fff8e1', border: '1px solid #f2c94c', borderRadius: 6,
-        padding: '8px 14px', marginBottom: 16, fontSize: 12, color: '#b8860b',
+        padding: '8px 14px', marginBottom: 14, fontSize: 11, color: '#b8860b',
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8,
       }}>
-        ⚠️ <strong>演示数据，不作为正式操作依据。</strong>当前页面所有数据均为 IEEE33 标准测试模型的内置示例数据，非实际生产电网数据。
+        <span>⚠️ 当前为 IEEE33 仿真验证阶段，运行限值、安全规则、操作票模板均为内置示例，非实际生产定值。</span>
+        <span style={{ fontSize: 10, color: '#94a3b8' }}>
+          8010：<span style={{ color: algoAvailable ? '#1f8a4c' : '#b8860b' }}>{algoAvailable ? '在线' : '离线'}</span>
+          <span style={{ margin: '0 6px', color: '#c8d6e5' }}>|</span>
+          数据源：<span style={{ color: rtNodes.length > 0 ? '#1f8a4c' : '#b8860b' }}>{realtimeStatus}</span>
+        </span>
       </div>
 
-      {/* ====== 数据状态卡片 ====== */}
-      <div style={{ display: 'flex', gap: 12, marginBottom: 20, flexWrap: 'wrap' }}>
-        {statusCards.map((item) => (
-          <div key={item.label}
-            style={{
-              background: '#fff', border: '1px solid #c8d6e5', borderRadius: 6,
-              padding: '14px 20px', flex: 1, minWidth: 150,
-              display: 'flex', flexDirection: 'column', gap: 6,
-            }}
-          >
-            <span style={{ fontSize: 12, color: '#667085' }}>{item.label}</span>
-            <StatusBadge status={item.status} />
-            <span style={{ fontSize: 11, color: '#94a3b8' }}>{item.desc}</span>
-            <span style={{ fontSize: 10, color: '#b0b8c1' }}>{item.note}</span>
+      {/* ====== 2. 概览卡片 ====== */}
+      <div style={{ display: 'flex', gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
+        {[
+          { label: '节点', value: rtNodes.length || 33, sub: rtNodes.length > 0 ? 'Simulink 实时' : 'IEEE33 静态', ok: rtNodes.length > 0 },
+          { label: '线路', value: rtLines.length || 37, sub: rtLines.length > 0 ? '37条（含5条联络线）' : 'IEEE33 静态', ok: rtLines.length > 0 },
+          { label: '联络开关', value: '5 组', sub: 'T1-T5 常开', ok: null },
+          { label: '运行限值', value: '6 项', sub: '示例定值', ok: false },
+        ].map(item => (
+          <div key={item.label} style={{
+            background: '#fff', border: '1px solid #c8d6e5', borderRadius: 6,
+            padding: '12px 18px', flex: 1, minWidth: 110,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+              <span style={{ display:'inline-block', width:7, height:7, borderRadius:'50%',
+                background: item.ok === true ? '#1f8a4c' : item.ok === false ? '#f2c94c' : '#94a3b8' }} />
+              <span style={{ fontSize: 11, color: '#667085' }}>{item.label}</span>
+            </div>
+            <div style={{ fontSize: 20, fontWeight: 700, color: '#1f2937' }}>{item.value}</div>
+            <div style={{ fontSize: 10, color: '#94a3b8' }}>{item.sub}</div>
           </div>
         ))}
       </div>
 
-      {/* ====== 数据对象维护表 ====== */}
-      <SectionCard title="数据对象维护" style={{ marginBottom: 20 }} extra={
-        <span style={{ fontSize: 11, color: '#b8860b', background: '#fff8e1', padding: '2px 8px', borderRadius: 3, border: '1px solid #f2c94c' }}>
-          ⚠ 演示数据，不作为正式操作依据
-        </span>
-      }>
-        <div style={{ overflowX: 'auto' }}>
-          <DataTable columns={objectColumns} data={dataObjects} rowKey={(r) => r.id} />
-        </div>
+      {/* ====== 3. 数据对象维护（可点击查看详情） ====== */}
+      <SectionCard title="数据对象维护" style={{ marginBottom: 16 }}>
+        <DataTable columns={objectColumns} data={dataObjects} rowKey={r => r.id} />
       </SectionCard>
 
-      {/* ====== 规则/模板维护表 ====== */}
-      <SectionCard title="规则/模板维护" style={{ marginBottom: 20 }} extra={
-        <span style={{ fontSize: 11, color: '#b8860b', background: '#fff8e1', padding: '2px 8px', borderRadius: 3, border: '1px solid #f2c94c' }}>
-          ⚠ 演示数据，不作为正式操作依据
-        </span>
-      }>
-        <div style={{ overflowX: 'auto' }}>
-          <DataTable columns={ruleColumns} data={ruleTemplates} rowKey={(r) => r.id} />
-        </div>
+      {/* ====== 4. 安全校验规则 ====== */}
+      <SectionCard title="安全校验规则（8 项）" style={{ marginBottom: 16 }}>
+        <DataTable columns={ruleColumns} data={SAFETY_RULES} rowKey={r => r.id} />
       </SectionCard>
 
-      {/* ====== 数据导入流程 ====== */}
-      <SectionCard title="数据导入流程" style={{ marginBottom: 20 }}>
-        <div style={{
-          background: '#e3f0ff', border: '1px solid #90caf9', borderRadius: 4,
-          padding: '8px 12px', marginBottom: 14, fontSize: 12, color: '#2f80ed',
-        }}>
-          ℹ️ 当前版本仅支持前端选择文件与字段预览，真实导入/发布/回滚待后端实现。
-        </div>
-        <p style={{ fontSize: 12, color: '#667085', marginBottom: 14 }}>
-          用于拓扑模型、设备台账、运行限值和规则模板的统一导入与版本管理。
-        </p>
-        <input ref={fileRef} type="file" accept=".xlsx,.csv" style={{ display: 'none' }} onChange={handleFileChange} />
-        {selectedFile && (
-          <div style={{ marginBottom: 12, padding: '8px 14px', background: '#e8f5e9', borderRadius: 4, fontSize: 12, color: '#1f8a4c' }}>
-            已选择文件：<strong>{selectedFile}</strong>（仅前端读取文件名，未上传至后端）
-          </div>
-        )}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 0, flexWrap: 'wrap' }}>
-          {importSteps.map((step, i) => (
-            <div key={step.label} style={{ display: 'flex', alignItems: 'center' }}
-              onClick={() => handleImportStep(i)}>
-              <div style={{
-                padding: '14px 20px', borderRadius: 6, textAlign: 'center', minWidth: 110, cursor: 'pointer',
-                background: i < importStep ? '#e8f5e9' : i === importStep ? '#e3f0ff' : '#f3f6f9',
-                border: `2px solid ${i < importStep ? '#1f8a4c' : i === importStep ? '#2f80ed' : '#c8d6e5'}`,
-                transition: 'all 0.15s',
-              }}>
-                <div style={{ fontSize: 18, fontWeight: 700,
-                  color: i < importStep ? '#1f8a4c' : i === importStep ? '#2f80ed' : '#94a3b8',
-                  marginBottom: 4 }}>
-                  {i < importStep ? '✓' : i + 1}
-                </div>
-                <div style={{ fontSize: 13, fontWeight: 600, color: '#1f2937', marginBottom: 2 }}>{step.label}</div>
-                <div style={{ fontSize: 11, color: '#667085' }}>{step.desc}</div>
-              </div>
-              {i < importSteps.length - 1 && (
-                <div style={{ color: '#c8d6e5', fontSize: 18, padding: '0 4px', flexShrink: 0, cursor:'default' }}>→</div>
-              )}
-            </div>
-          ))}
-        </div>
-      </SectionCard>
-
-      {/* ====== 底部说明 ====== */}
+      {/* ====== 5. 底部数据链路 ====== */}
       <div style={{
         background: '#f3f6f9', border: '1px solid #c8d6e5', borderRadius: 6,
-        padding: '10px 16px', fontSize: 12, color: '#667085',
+        padding: '10px 16px', fontSize: 11, color: '#667085',
       }}>
-        <strong style={{ color: '#1f2937' }}>功能说明：</strong>
-        当前版本为原型演示系统，所有数据均为 IEEE33 标准测试模型的内置示例数据。支持 Excel/CSV 文件选择（前端读取文件名），真实导入/校验/发布/回滚将在后续版本中实现。
-        <span style={{ display: 'block', marginTop: 4, color: '#94a3b8' }}>数据来源：topologyData.ts（静态拓扑） + Simulink 实时推送（开关状态/负荷/电压） + 内置示例（限值/模板/规则）</span>
+        <strong style={{ color: '#1f2937' }}>数据链路：</strong>
+        实时开关状态/负荷/电压(Simulink → 实时接口 → 后端 8000) → 拓扑模型(静态 IEEE33 + 实时注入) → 联络开关容量(内置默认值) → 运行限值(内置示例) → 安全校验规则(内置 8 项) → 操作票模板(内置 4 套)
+        <span style={{ display: 'block', marginTop: 4, color: '#94a3b8' }}>
+          生产环境下，运行限值、安全规则和操作票模板需由电网运方部门确认后录入。实时数据来源通过 Simulink Token 验证。
+        </span>
       </div>
 
       {/* ====== 详情弹窗 ====== */}
       {detail && (
-        <div style={{ position:'fixed', top:0, left:0, right:0, bottom:0,
-          background:'rgba(0,0,0,0.3)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:1000 }}
-          onClick={() => setDetail(null)}>
-          <div style={{ background:'#fff', borderRadius:8, padding:24, width:480, maxHeight:'70vh', overflow:'auto', boxShadow:'0 4px 16px rgba(0,0,0,0.15)' }}
-            onClick={(e) => e.stopPropagation()}>
-            <h3 style={{ fontSize:15, fontWeight:600, marginBottom:16, color:'#1f2937', paddingBottom:10, borderBottom:'1px solid #e2e8f0' }}>
-              {detail.title}
-            </h3>
-            {detail.rows.map((r, i) => (
-              <div key={i} style={{ padding:'6px 0', fontSize:13, color: r.startsWith('⚠') ? '#b8860b' : '#1f2937', borderBottom:'1px solid #f3f6f9' }}>
-                {r}
-              </div>
-            ))}
-            <button onClick={() => setDetail(null)}
-              style={{ marginTop:16, padding:'6px 20px', borderRadius:4, border:'1px solid #c8d6e5', background:'#f3f6f9', color:'#667085', cursor:'pointer', fontSize:13, width:'100%' }}>
-              关闭
-            </button>
-          </div>
-        </div>
+        <DetailModal
+          title={detail.title} type={detail.type}
+          onClose={() => setDetail(null)}
+          data={{ nodes: rtNodes, lines: rtLines, branches: topoBranches, ties: topoTies }}
+        />
       )}
     </PageContainer>
   );

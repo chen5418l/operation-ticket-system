@@ -13,8 +13,8 @@ const menuItems: MenuItem[] = [
   { key: '/boundary-judgment', label: '边界判定', icon: '🔀' },
   { key: '/transfer-decision', label: '转供决策', icon: '🛣️' },
   { key: '/sequence-generation', label: '操作序列生成', icon: '📋' },
-  { key: '/ticket-generation', label: '模板化成票', icon: '📝' },
   { key: '/safety-check', label: '安全校验', icon: '🛡️' },
+  { key: '/ticket-generation', label: '模板化成票', icon: '📝' },
   { key: '/statistics', label: '测试统计', icon: '📈' },
 ];
 

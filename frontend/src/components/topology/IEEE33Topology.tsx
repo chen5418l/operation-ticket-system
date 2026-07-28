@@ -43,8 +43,9 @@ export default function IEEE33Topology({ predictData, realtimeData }: { predictD
       const fid = Array.from(faultLineIds)[0];
       const fl = findLine(fid);
       if (fl) {
-        localStorage.setItem('current_fault_line', `${fl.fromNum}-${fl.toNum}`);
-        localStorage.setItem('current_fault_source', '拓扑图选择');
+        import('../../store/workflowStore').then(({ saveCurrentWorkflow }) => {
+          saveCurrentWorkflow({ fault_line: `${fl.fromNum}-${fl.toNum}` });
+        });
       }
     }
   }, [faultLineIds]);
